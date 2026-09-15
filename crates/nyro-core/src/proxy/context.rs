@@ -327,9 +327,11 @@ use axum::response::Response;
 /// Axum middleware that creates a `RequestContext` and stores it as an
 /// `Extension`.  Mount this as the outermost layer on the proxy router.
 ///
-/// The timeout used is 300 s (matching the existing reqwest client timeout).
-/// P2 can thread per-route timeouts through here once `RequestContext` carries
-/// a configurable timeout.
+/// The deadline used is 300 s. The reqwest client itself enforces a 30 s
+/// connect timeout plus a 300 s per-read timeout (each streaming chunk
+/// resets the read timer), so long streams are not cut off by a total
+/// timeout. P2 can thread per-route timeouts through here once
+/// `RequestContext` carries a configurable timeout.
 pub async fn inject_context(mut request: Request, next: Next) -> Response {
     // We don't know the ingress protocol at middleware time; it will be
     // overwritten by the ingress handler via `inject_context_with_protocol`.

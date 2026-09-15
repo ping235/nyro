@@ -32,6 +32,30 @@ use super::{
     error_response, run_phase_hooks_slice,
 };
 
+/// Human-readable description of an upstream body-stream failure.
+///
+/// `reqwest::Error` for body failures is a generic `Kind::Decode` whose
+/// `Display` ("error decoding response body") hides the real cause (timeout,
+/// connection reset, HTTP/2 RST_STREAM, malformed chunk, truncated
+/// content-length, …). `is_timeout()` preserves the timeout case, and the
+/// underlying `hyper` error is only reachable through the
+/// `std::error::Error` source chain — reqwest's `Display` ignores the
+/// alternate flag, so `{e:#}` is no more detailed than `{e}`. Walk the
+/// chain explicitly.
+fn describe_upstream_stream_error(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        "upstream stream timed out (no data within the read-timeout window)".to_string()
+    } else {
+        let mut parts = vec![format!("upstream stream error: {e}")];
+        let mut source = std::error::Error::source(e);
+        while let Some(s) = source {
+            parts.push(format!("  caused by: {s}"));
+            source = s.source();
+        }
+        parts.join("\n")
+    }
+}
+
 // ── Streaming response handler ────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -159,11 +183,18 @@ pub(super) async fn handle_stream(
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "upstream stream error during passthrough");
-                        stream_error = Some(e.to_string());
+                        let detail = describe_upstream_stream_error(&e);
+                        tracing::warn!(
+                            error = %detail,
+                            upstream_response_headers = upstream_hdrs_pt.as_deref().unwrap_or(""),
+                            bytes_received = log_buf.len(),
+                            chunks_received = chunks_count,
+                            "upstream stream error during passthrough"
+                        );
+                        stream_error = Some(detail.clone());
                         // Emit an Anthropic-protocol error event so the client
                         // gets an explicit signal instead of a truncated stream.
-                        let msg = e.to_string().replace('"', "\\\"");
+                        let msg = detail.replace('"', "\\\"");
                         let err_sse = format!(
                             "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"stream_error\",\"message\":\"{msg}\"}}}}\n\n"
                         );
@@ -280,7 +311,13 @@ pub(super) async fn handle_stream(
                 Err(e) => {
                     // P1: emit an explicit terminal event instead of silently breaking,
                     // so the client receives a defined stop_reason and does not hang.
-                    tracing::warn!(error = %e, "upstream stream error; emitting terminal event");
+                    let detail = describe_upstream_stream_error(&e);
+                    tracing::warn!(
+                        error = %detail,
+                        bytes_received = upstream_raw_buf.len(),
+                        chunks_received = chunks_count,
+                        "upstream stream error; emitting terminal event"
+                    );
                     let error_deltas = [AiStreamDelta::Done {
                         stop_reason: "error".to_string(),
                     }];
