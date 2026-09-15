@@ -170,7 +170,13 @@ impl Gateway {
         mysql_pool: Option<Pool<MySql>>,
     ) -> anyhow::Result<(Self, mpsc::Receiver<LogEntry>)> {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            // No total request timeout: a total deadline would kill long
+            // streaming responses mid-body (surfacing as a generic
+            // "error decoding response body"). Instead bound the connect
+            // phase and the silence between body reads; each streamed
+            // chunk resets the read timer.
+            .connect_timeout(std::time::Duration::from_secs(300))
+            .read_timeout(std::time::Duration::from_secs(3600))
             .build()?;
 
         let model_cache = Arc::new(tokio::sync::RwLock::new(
@@ -344,7 +350,12 @@ impl Gateway {
             return Ok(cached.client);
         }
 
-        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300));
+        // Same timeout policy as the default client: connect + per-read
+        // timeouts, never a total request timeout that would cut off long
+        // streaming responses mid-body.
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(300))
+            .read_timeout(std::time::Duration::from_secs(3600));
         if force_http1 {
             builder = builder.http1_only();
         }
