@@ -1,10 +1,10 @@
 # Nyro Rust 目标架构
 
-> 状态：设计定稿，分阶段实施中；独立内核与首个实验性 standalone LLM 数据面已实现。更新日期：2026-09-08。
+> 状态：设计定稿，分阶段实施中；独立内核与首个实验性 standalone LLM 数据面已实现。更新日期：2026-09-16。
 >
 > 本文是本轮 Rust 重构的目标架构依据，不代表代码已完成迁移。目录树、Rust 类型示例和命令形态均为目标设计；当前实现请查看[现有 workspace](../../Cargo.toml)和本文的现状对应表。
 
-当前已落地独立的 [`nyro-kernel`](../../crates/nyro-kernel/README_CN.md)，以及使用它的实验性源码构建根命令 [`nyro proxy --config`](../standalone/rust-proxy_CN.md)。该命令实现严格文件配置、按授权过滤的模型发现、OpenAI Chat/Embedding、无状态 Responses、Anthropic/Gemini Chat 与跨协议 SSE 子集、多 backend 优先级／加权选择与有界故障转移、认证授权、共享并发限制、模型请求频率限制、累计 token 额度、请求／尝试关联用量观测、Unix SIGHUP 文件配置重载和代际 lease。现有 `nyro-core`、已发布 Server 和 Tauri 请求路径尚未接入该内核；`nyro serve`、`nyro tool`、控制面和其余目标能力仍未实现。
+当前已落地独立的 [`nyro-kernel`](../../crates/nyro-kernel/README_CN.md)，以及使用它的实验性源码构建根命令 [`nyro proxy --config`](../standalone/rust-proxy_CN.md)。该命令实现严格文件配置、按授权过滤的模型发现、OpenAI Chat/Embedding、无状态 Responses、Anthropic/Gemini Chat 与跨协议 SSE 子集、多 backend 优先级及 weighted／least_recent／latency 选择与有界故障转移、认证授权、共享并发限制、模型请求频率限制、主体 RPM／RPD 与 TPM／TPD 滚动窗口、累计 token 额度、请求／尝试关联用量观测、Provider 显式 HTTP／HTTPS 出口代理与独立 HTTP/1 配置、Unix SIGHUP 文件配置重载和代际 lease。实验性 [`nyro serve`](../standalone/rust-serve_CN.md) 已复用该数据面，新增专用 SQLite 完整配置草稿、Provider／Model／API Key 实体管理、凭证脱敏查询、版本比较与显式发布。现有 `nyro-core`、已发布 Server 和 Tauri 请求路径尚未接入该内核；控制面其余管理能力、`nyro tool` 和产品切换仍待实现。
 
 ## 1. 产品定位与范围
 
@@ -20,7 +20,7 @@ Nyro 是统一的 AI Gateway，目标是在一个进程内承载 LLM Gateway 和
 | `nyro proxy` | 只运行数据面，从 standalone 文件或控制面获取配置 |
 | `nyro tool` | 承接录制、回放、调试透传和 schema 导出等现有工具能力 |
 
-目标中的 `serve` 与 `proxy` 使用同一套数据面构建和执行流程，区别在于配置来源及是否装配控制面。将来可以按配置启用 LLM、MCP 或两者；当前仅 `nyro proxy --config PATH` 可从源码运行，且只装配 LLM 文件数据面。`serve`、`tool` 和 MCP 仍是目标能力。
+目标中的 `serve` 与 `proxy` 使用同一套数据面构建和执行流程，区别在于配置来源及是否装配控制面。将来可以按配置启用 LLM、MCP 或两者；当前 `nyro proxy --config PATH` 装配 LLM 文件数据面，`nyro serve --database PATH --admin-token-file PATH` 装配相同数据面与最小 SQLite 控制面；后者仅初始化时接受 `--config PATH`。WebUI、`tool` 和 MCP 仍是目标能力。
 
 ## 2. 核心原则
 
@@ -119,6 +119,8 @@ nyro/
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── rate.rs
+│   │   │   ├── request.rs           # 滚动请求窗口与组合准入
+│   │   │   ├── window.rs            # 滚动用量预留与结算
 │   │   │   ├── quota.rs
 │   │   │   ├── concurrency.rs
 │   │   │   ├── store.rs             # 限制能力所需的原子状态操作
@@ -381,7 +383,7 @@ SQLite / Postgres → 控制面业务读取 → publish 构建、校验 ──�
                            进程内交付或控制面配置分发 → 数据面协调器
 ```
 
-standalone 在启动时读取文件，Unix 上变更后可显式发送 `SIGHUP` 重载，其他平台需重启；不引入文件自动监听。目标控制面通过配置分发路径驱动在线更新。`serve` 内置的数据面也将消费同样的不可变快照，不在每个模型请求中直接读取管理数据库。
+standalone 在启动时读取文件，Unix 上变更后可显式发送 `SIGHUP` 重载，其他平台需重启；不引入文件自动监听。当前 `serve` 通过管理 API 保存完整草稿并显式发布，内置数据面消费同样的不可变快照，不在每个模型请求中读取管理数据库。它不通过 SIGHUP 重新导入种子文件。
 
 快照保存生效配置，不保存正在变化的许可、计数器、连接和请求状态。有效配置的确定性指纹用于跳过重复更新，不承诺某个序列化格式、hash 算法或 PATCH API。
 
@@ -428,7 +430,7 @@ HTTP 基础接入
 
 接入层先完成与代际无关的基础解析；依赖配置的解码、能力选择和后续执行使用同一个代际。认证身份、截止时间、路由结果、尝试状态和原始传输信息放在请求执行上下文，不扩散为每个 IR 的通用业务字段。
 
-当前已实现模型范围内带稳定 ID 的 backend 列表、优先级与同级加权选择：认证和准入之后，在本地按各 backend 的 codec 准备请求，仅在可表达该请求的可用项之间选择；没有兼容候选时返回请求错误。`max_attempts` 默认 `1`，显式开启后仅对连接建立失败及指定临时 HTTP 错误向其他 backend 故障转移，每个 backend 每请求至多尝试一次。可选的被动健康状态支持失败阈值、冷却和单个恢复探测；状态由根组合层显式跨代际共享，保留在 `nyro-llm`，不进入 kernel。旧单上游 YAML 在解析时归一化，列表顺序不影响配置指纹。完整配置与重试条件见 [Rust proxy 指南](../standalone/rust-proxy_CN.md)。
+当前已实现模型范围内带稳定 ID 的 backend 列表、优先级与同级 `weighted`（默认）／`least_recent`／`latency` 选择：认证和准入之后，在本地按各 backend 的 codec 准备请求，仅在可表达该请求的可用项之间选择；没有兼容候选时返回请求错误。`max_attempts` 默认 `1`，显式开启后仅对连接建立失败及指定临时 HTTP 错误向其他 backend 故障转移，每个 backend 每请求至多尝试一次。可选的被动健康状态支持失败阈值、冷却和单个恢复探测；状态由根组合层显式跨代际共享，保留在 `nyro-llm`，不进入 kernel。旧单上游 YAML 在解析时归一化，列表顺序不影响配置指纹。选择历史按公开模型和有效 backend 绑定共享，权重／优先级／策略变更保留，凭证、出口代理地址／认证和 HTTP 版本模式等绑定变化重置；最近发起和延迟采样独立于健康状态，延迟只计每次发送到 2xx 响应头，包含少量探索以重新评估旧样本。完整配置与重试条件见 [Rust proxy 指南](../standalone/rust-proxy_CN.md)。
 
 LLM runtime 掌握必需阶段顺序、最终路由选择、重试预算、流提交状态及终态交付。可选扩展只能在声明槽位继续、拒绝或短路；提前产生结果仍由 runtime 完成协议交付和收尾。扩展不能跳过认证、授权或准入，不能自行调用下一阶段、发送上游请求或写入客户端响应，也不能取消已登记的 Finalizers。
 
@@ -533,7 +535,11 @@ OpenAI Chat／Responses 共用 `nyro_protocol::openai::ReasoningEffort`；旧 `o
 
 缓存计量属于 LLM 协议语义：`Usage.prompt_tokens` 包含普通输入、缓存读取和缓存写入，读取细分复用 `prompt_tokens_details.cached_tokens`，写入细分由可选的类型化 `Usage.cache_creation` 表达，TTL 明细是写入子集，不重复计数。可选写入明细使用 `Box<CacheCreationUsage>`，避免增大普通响应；直接构造 `Usage` 的消费者需提供该字段，无写入时设为 `None`。转换和校验由 `nyro-llm` codec 负责，wire 字段归 `nyro-protocol`；不引入通用 JSON 扩展袋、新 crate 或内核职责。无 TTL 明细的写入计数可在 OpenAI Chat／Responses／Anthropic 间映射，TTL 明细仅由 Anthropic 严格输出保留，Gemini 拒绝非零写入；原生路径保留原始 JSON，观测和 quota 使用经过校验的总量。请求缓存控制的当前子集见上文，跨协议策略映射及金额计费仍是独立待办。
 
-根程序通过 `nyro_llm::runtime::SharedResources` 显式共享健康、rate 和 quota 注册表。quota 已消耗及在途账本在模型移除／加回后继续保留；有活跃绑定或已消费余额时修改规则会拒绝候选构建，避免配置变更清零。进程重启会重置进程内状态。quota 超限返回原生协议 `429`，不带 `Retry-After` 并立即释放并发许可；其之前的 rate 准入不退款。计量、协议映射和资源组合均未进入 `nyro-kernel`。
+主体请求限制由 `llm.subject_limits.<主体 ID>.rpm/rpd` 配置，绑定已有认证主体，在模型别名、API、工作负载和严格／原生路径间共享。`nyro-limit/request` 提供单调时钟滚动窗口，与模型令牌桶原子准入；请求规则拒绝不部分扣费。准入按逻辑请求计一次，重试不重复，后续失败或取消不退款。`nyro-llm/subject_limit` 保留活跃和未过期历史，轮换、禁用／重新启用及移除／重新加入不清零；参数冲突拒绝候选，闲置过期状态可回收。匿名请求只有模型级限制，认证调用匿名模型仍受主体限制。请求窗口使用最近 60 秒／24 小时，不是午夜重置；主体 token 窗口已按下文实现，持久化与多副本协调继续由 G07 跟踪。配置与具体边界见[代理指南](../standalone/rust-proxy_CN.md#主体请求窗口)。
+
+主体 `tpm/tpd/reserve_tokens` 使用 `nyro-limit/window::WindowQuota`，按通用单位处理滚动已结算用量及不随时间过期的在途预留。LLM 每次上游尝试与模型累计 quota 原子预留，逻辑请求次数仍按原步骤计一次；协议完成后按实际用量结算，连接建立失败释放，未知／失败结果分别按各预算预留与有效用量的较大值扣费。正结算从结算时刻保留 60 秒／24 小时，长流跨窗不提前释放预留，超额如实记账阻止后续准入；不承诺真实上游消耗硬上限。复用现有用量校验与终态清理，观测独立记录主体和模型扣费，避免叠加成报告用量。代际注册表同时保留请求、token 历史及在途预留，活跃或未清空策略的参数变更拒绝候选。配置、等待 Header 和 Rust 调用方字段迁移见[代理指南](../standalone/rust-proxy_CN.md#主体-token-窗口)。
+
+根程序通过 `nyro_llm::runtime::SharedResources` 显式共享路由历史、健康、模型 rate、主体请求窗口和 quota 注册表。quota 已消耗及在途账本在模型移除／加回后继续保留；有活跃绑定或已消费余额时修改规则会拒绝候选构建，避免配置变更清零。进程重启会重置进程内状态。quota 超限返回原生协议 `429`，不带 `Retry-After` 并立即释放并发许可；其之前的 rate 准入不退款。计量、协议映射和资源组合均未进入 `nyro-kernel`。
 
 观测初始化与资源装配由根程序协调。共享观测实现不认识模型数据库表；控制面的历史日志和统计读取归其业务存储。配置代际租约与限流并发许可是不同概念，不能复用一个计数器代替二者。
 
@@ -542,6 +548,14 @@ OpenAI Chat／Responses 共用 `nyro_protocol::openai::ReasoningEffort`；旧 `o
 ## 10. 存储与数据库访问
 
 ### 10.1 文件来源与数据库仓储
+
+当前实现由 [`nyro-control`](../../crates/nyro-control/src/lib.rs) 拥有类型化快照、严格 schema 校验和专用 SQLite 单行存储，其 [`entity`](../../crates/nyro-control/src/entity.rs) 模块拥有实体编辑命令、凭证更新、引用检查和脱敏投影；复用 `nyro-config` 快照、`nyro-llm` 配置类型和 `nyro-security` 密钥类型，不负责 HTTP 或 Host 激活。根 [`src/control.rs`](../../src/control.rs) 负责管理认证、服务持有队列和发布，[`src/control/entity.rs`](../../src/control/entity.rs) 仅适配 HTTP，[`src/serve.rs`](../../src/serve.rs) 负责启动、独立回环管理监听及退出。`nyro-kernel` 和 `nyro-llm` 不依赖控制面或数据库。
+
+发布先校验进程设置并构建候选，再提交 SQLite 已发布快照，最后激活 Host；不宣称数据库与代际跨资源原子提交。提交前拒绝保持旧发布目标及活动代际；提交后激活中断返回 `202 pending`，重启恢复持久化目标。API 区分草稿、已发布和活动版本，重复发布等价快照不新建代际。接受后的写操作由服务持有，客户端断连不取消它，调用方需用 GET 核对结果。详情见[服务指南](../standalone/rust-serve_CN.md)。
+
+`GET /admin/config` 及 Provider／Model／API Key 列表和详情均为脱敏投影，凭证只表示为 `has_*`，整个代理 URL 不公开。显式 `GET /admin/config/export` 保留原完整配置响应及明文凭证，沿用管理认证与 `no-store`；完整配置编辑从导出开始，不能将读取投影直接写回。文件／SQLite 仍保存原始凭证。实体编辑与完整配置 PUT 共用全局草稿版本和完整校验，元数据完整替换，凭证通过 Keep／Set／Clear 显式更新；省略凭证保留旧值。引用中的 Provider／API Key 删除被拒绝，不级联；编辑不自动发布。
+
+存储只持久化配置，限制计数、健康和路由历史仍在内存。SQLite 保持单进程独占，不导入旧库；Postgres、WebUI、OAuth、持久化观测与多副本协调仍待完成。本轮实体管理复用现有 crate 和 SQLite v1 schema。下表及 10.2 的目录是后续目标划分，当前 SQLite 实现仅位于 `nyro-control/src/storage.rs`。
 
 | 方式 | 所在位置 | 语义 |
 |---|---|---|
@@ -561,11 +575,11 @@ OpenAI Chat／Responses 共用 `nyro_protocol::openai::ReasoningEffort`；旧 `o
 
 根装配层选择后端并持有连接资源，使用者持有连接池引用。候选重建不能关闭仍在使用的共享池。若后续限制模块确实需要自己的 SQL 状态，其查询和 schema 归 `nyro-limit`；只有实际出现共用连接代码时才考虑提取轻量数据库包，不能让限制模块反向依赖控制面。
 
-schema 的所有权不因共用数据库而合并。修改实际迁移源时仍必须遵守仓库的数据库文档与生成流程；参考 SQL 是派生产物，不手写。本轮不修改现有表结构、迁移或生成文件。
+schema 的所有权不因共用数据库而合并。修改实际迁移源时仍必须遵守仓库的数据库文档与生成流程；参考 SQL 是派生产物，不手写。G10 新增独立 SQLite v1 schema，见[数据库文档](../database/schema.md)；旧表与 PostgreSQL/MySQL 参考 schema 保持原有契约。
 
 ## 11. 现有实现与目标对应
 
-采用新旧实现并行开发、最后统一切换入口的迁移方式。新能力包已加入 workspace，且不依赖旧 `nyro-core`；旧入口继续承担现有发布，新实现独立构建和测试。当前已交付独立内核、协议／LLM／配置／安全／并发能力包，以及从严格 YAML 启动的实验性根 `nyro proxy`。接下来仍需补齐现有能力，再接入控制面与工具。
+采用新旧实现并行开发、最后统一切换入口的迁移方式。新能力包已加入 workspace，且不依赖旧 `nyro-core`；旧入口继续承担现有发布，新实现独立构建和测试。当前已交付独立内核、协议／LLM／配置／安全／并发能力包，以及从严格 YAML 启动的实验性根 `nyro proxy`。同时已接入实验性 SQLite `serve` 发布闭环与实体草稿管理；控制面其余能力、兼容对齐与工具仍待推进。
 
 按 PR #323 基线核对的具体差异、后续关闭状态、代码／测试证据与建议顺序见 [Rust 迁移差异审计](rust-migration-gaps.md)。该清单区分现有子集、旧行为兼容取舍和未来扩展，不能仅凭同名功能认定迁移完成。该临时清单在整体迁移完成后连同本处引用删除，不做归档；长期架构与升级说明保留在正式文档中。
 
@@ -574,8 +588,8 @@ schema 的所有权不因共用数据库而合并。修改实际迁移源时仍�
 | 阶段 | 当前进度 | 差异跟踪 |
 |---|---|---|
 | 内核、代际、文件配置 | 基础机制已落地；SIGHUP 重载已有回归 | 后续能力必须保持生命周期与清理约束 |
-| LLM 数据面 | 主要执行链已落地；模型发现 G01 已补齐，G02 已支持显式开启 OpenAI Chat／无状态 Responses／Anthropic Messages／单候选 Gemini 原生 JSON/SSE 保真；G04 已补充 Anthropic／Gemini 完整工具结果批次、显式错误状态边界、文本结果块与 Gemini ID／顺序校验；函数 Schema 已补充 JSON 约束保留、Gemini 方言转换与 strict 目标边界；G03 已补充用户图片输入及目标限制、缓存读取转换与 Anthropic 缓存写入／TTL 计量边界、OpenAI 当前缓存选项／兼容 retention 及原生缓存放置回归；有序 IR 已支持 Anthropic／Gemini／Responses 历史、JSON 和 SSE 交错顺序，以及各自专有推理的同协议保留，Chat 不可表达顺序明确拒绝；工具结果图片已支持 Anthropic／Responses 保序互转与 Gemini 对象／媒体的同协议保留；整体兼容对齐未完成 | G02–G09 |
-| 控制面、存储、管理与持久化观测 | 尚未接入新架构 | G10–G12 |
+| LLM 数据面 | 主要执行链已落地；模型发现 G01 已补齐，G02 已支持显式开启 OpenAI Chat／无状态 Responses／Anthropic Messages／单候选 Gemini 原生 JSON/SSE 保真；G04 已补充 Anthropic／Gemini 完整工具结果批次、显式错误状态边界、文本结果块与 Gemini ID／顺序校验；函数 Schema 已补充 JSON 约束保留、Gemini 方言转换与 strict 目标边界；G03 已补充用户图片输入及目标限制、缓存读取转换与 Anthropic 缓存写入／TTL 计量边界、OpenAI 当前缓存选项／兼容 retention 及原生缓存放置回归；有序 IR 已支持 Anthropic／Gemini／Responses 历史、JSON 和 SSE 交错顺序，以及各自专有推理的同协议保留，Chat 不可表达顺序明确拒绝；工具结果图片已支持 Anthropic／Responses 保序互转与 Gemini 对象／媒体的同协议保留；本地三轮工具会话矩阵覆盖严格转换、匹配原生模式及图片／专有推理组合，真实客户端与厂商验收仍待完成；G06 文件代理已支持密钥禁用、认证时到期检查和代际重载；G07 已支持主体 RPM／RPD 和 TPM／TPD 滚动窗口、请求规则原子准入、主体／模型 token 预算原子预留与跨代际状态保留，持久化和多副本协调仍待完成；整体兼容对齐未完成 | G02–G09 |
+| 控制面、存储、管理与持久化观测 | G10 部分完成：SQLite 完整草稿、Provider／Model／API Key CRUD、脱敏查询与显式导出、管理认证、版本冲突、显式发布和重启恢复；Postgres、WebUI、OAuth、旧数据导入、持久化预算和观测尚未完成 | G10–G12 |
 | 工具、部署和旧入口切换 | 尚未完成切换验收 | G11、G13 |
 
 完成协议与 Provider 回归、流式响应和取消收尾、配置更新、SQLite/Postgres 数据兼容、管理 API/WebUI 及工具命令验证后，再统一切换构建、安装和发布流程，移除 Tauri、旧 Server/Tools 入口及失去消费者的旧代码。旧五阶段 Hook 框架随旧运行时退出，认证、准入、响应处理、终态日志和资源收尾先由新运行时承接。
@@ -585,7 +599,7 @@ schema 的所有权不因共用数据库而合并。修改实际迁移源时仍�
 | 当前实现或历史方案 | 目标归属与差异 |
 |---|---|
 | `crates/nyro-core/` 与整体 `Gateway` | 拆为八个职责包；按使用者注入必要资源，减少全局状态依赖 |
-| `src-server/`、`nyro-server --mode ...` | 继续承担现有发布；根 `src/` 已实现实验性文件配置 `nyro proxy`，`nyro serve` 与 `nyro-control` 仍是目标 |
+| `src-server/`、`nyro-server --mode ...` | 继续承担现有发布；根 `src/` 已实现实验性文件配置 `nyro proxy` 和专用 SQLite `nyro serve`，`nyro-control` 承接快照存储、实体编辑和脱敏投影 |
 | `src-tauri/`、桌面 IPC、桌面发布工作流 | 退出目标产品形态；WebUI 通过服务端管理 API 工作 |
 | `crates/nyro-tools/` 独立工具二进制 | 现有能力迁入唯一二进制的 `nyro tool` 命令族 |
 | `crates/nyro-core/src/protocol/ir/` 的 `AiRequest` / `AiResponse` | `nyro-llm` 内入口枚举与 Chat、Embedding 配对类型 |
@@ -594,7 +608,7 @@ schema 的所有权不因共用数据库而合并。修改实际迁移源时仍�
 | 当前 `PluginKernel`、全局注册表与五阶段 Hook 方案 | 微内核只管理资源；应用掌握可信执行；根程序显式装配 |
 | 当前 `crates/nyro-core/src/storage/` 与 `src-server/src/yaml_config.rs` | 管理仓储归控制面，文件来源归配置包，领域状态归所属模块 |
 | 旧 Rust 的 MySQL 后端及 `deploy/schema/mysql.sql` | 不进入本轮目标支持范围；本轮文档更新不删除实现或生成文件 |
-| 当前 `README.md` / `README_CN.md`、运行手册、`AGENTS.md` | 继续说明已发布旧入口，并单独标出实验性源码构建代理及其独立配置格式 |
+| 当前 `README.md` / `README_CN.md`、运行手册、`AGENTS.md` | 继续说明已发布旧入口，并单独标出实验性源码构建代理／服务及其独立配置格式 |
 
 目标支持范围为 standalone 文件配置、SQLite 和 Postgres。现有 schema、数据和 CLI 的迁移兼容措施属于后续实施计划；本设计不授权删除用户数据或隐式迁移数据库。
 

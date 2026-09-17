@@ -14,9 +14,11 @@ fn valid_config() -> Config {
     Config {
         server: ServerConfig::default(),
         llm: LlmConfig {
+            subject_limits: BTreeMap::new(),
             providers: BTreeMap::from([(
                 "openai".into(),
                 Provider {
+                    transport: Default::default(),
                     native_chat: false,
                     kind: ProviderKind::Openai,
                     api: None,
@@ -27,6 +29,7 @@ fn valid_config() -> Config {
             models: BTreeMap::from([(
                 "chat".into(),
                 Model {
+                    strategy: Default::default(),
                     max_attempts: 1,
                     health: None,
                     rate: None,
@@ -48,6 +51,8 @@ fn valid_config() -> Config {
             api_keys: vec![ApiKey {
                 id: "deploy".into(),
                 secret: "client-secret".into(),
+                enabled: true,
+                expires_at: None,
             }],
         },
         limit: LimitConfig::default(),
@@ -139,6 +144,8 @@ fn validation_reuses_credential_rules_and_enforces_model_subjects() {
     config.security.api_keys.push(ApiKey {
         id: "deploy".into(),
         secret: "other-secret".into(),
+        enabled: true,
+        expires_at: None,
     });
     assert!(config.validate().is_err());
 
@@ -177,6 +184,8 @@ fn validation_rejects_blank_ids_and_non_bearer_secrets_with_a_generic_error() {
         config.security.api_keys[0] = ApiKey {
             id: id.into(),
             secret: secret.into(),
+            enabled: true,
+            expires_at: None,
         };
 
         let error = config.validate().unwrap_err().to_string();
@@ -217,6 +226,8 @@ fn fingerprint_is_canonical_and_excludes_listen_address() {
     first.security.api_keys.push(ApiKey {
         id: "ops".into(),
         secret: "second-client-secret".into(),
+        enabled: true,
+        expires_at: None,
     });
     let mut equivalent = first.clone();
     equivalent.server.listen = "0.0.0.0:8080".parse::<SocketAddr>().unwrap();
@@ -576,5 +587,155 @@ fn yaml_rejects_invalid_quota_policy_values() {
             .is_err(),
             "{policy}"
         );
+    }
+}
+
+#[test]
+fn api_key_lifecycle_defaults_and_changes_have_stable_fingerprints() {
+    use serde_json::json;
+    let mut value = serde_json::to_value(valid_config()).unwrap();
+    value["security"]["api_keys"][0] = json!({"id":"deploy","secret":"client-secret"});
+    let original = Config::from_yaml(&value.to_string()).unwrap();
+    value["security"]["api_keys"][0]["enabled"] = json!(true);
+    value["security"]["api_keys"][0]["expires_at"] = json!(null);
+    let explicit = Config::from_yaml(&value.to_string()).unwrap();
+    assert_eq!(
+        original.fingerprint().unwrap(),
+        explicit.fingerprint().unwrap()
+    );
+    value["security"]["api_keys"][0]["enabled"] = json!(false);
+    let disabled = Config::from_yaml(&value.to_string()).unwrap();
+    assert_ne!(
+        original.fingerprint().unwrap(),
+        disabled.fingerprint().unwrap()
+    );
+    value["security"]["api_keys"][0]["enabled"] = json!(true);
+    value["security"]["api_keys"][0]["expires_at"] = json!(0);
+    let expired = Config::from_yaml(&value.to_string()).unwrap();
+    assert_ne!(
+        original.fingerprint().unwrap(),
+        expired.fingerprint().unwrap()
+    );
+    assert_eq!(
+        expired.llm.models["chat"].subjects,
+        original.llm.models["chat"].subjects
+    );
+    value["security"]["api_keys"][0]["expires_at"] = json!(u64::MAX);
+    let later = Config::from_yaml(&value.to_string()).unwrap();
+    assert_ne!(expired.fingerprint().unwrap(), later.fingerprint().unwrap());
+}
+
+#[test]
+fn api_key_lifecycle_rejects_malformed_fields_without_disclosing_values() {
+    use serde_json::json;
+    for (field, invalid) in [
+        ("enabled", json!(null)),
+        ("enabled", json!("false")),
+        ("enabled", json!(0)),
+        ("expires_at", json!(-1)),
+        ("expires_at", json!(1.5)),
+        ("expires_at", json!("private-invalid-time")),
+        ("expires_at", json!(true)),
+    ] {
+        let mut value = serde_json::to_value(valid_config()).unwrap();
+        value["security"]["api_keys"][0][field] = invalid;
+        let error = Config::from_yaml(&value.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("client-secret") && !error.contains("private-invalid-time"));
+    }
+}
+
+#[test]
+fn subject_request_policy_references_existing_subject_and_affects_fingerprint() {
+    let original = valid_config();
+    let mut value = serde_json::to_value(&original).unwrap();
+    value["llm"]["subject_limits"] = serde_json::json!({"deploy":{"rpm":2,"rpd":10}});
+    let mut configured: Config = serde_json::from_value(value.clone()).unwrap();
+    configured.validate().unwrap();
+    assert_ne!(
+        configured.fingerprint().unwrap(),
+        original.fingerprint().unwrap()
+    );
+    configured.security.api_keys[0].enabled = false;
+    configured.security.api_keys[0].expires_at = Some(0);
+    configured.validate().unwrap();
+    value["llm"]["subject_limits"] = serde_json::json!({"unknown":{"rpm":2}});
+    let unknown: Config = serde_json::from_value(value).unwrap();
+    assert!(unknown.validate().is_err());
+    let mut omitted = serde_json::to_value(&original).unwrap();
+    omitted["llm"]["subject_limits"] = serde_json::json!({});
+    assert_eq!(
+        serde_json::from_value::<Config>(omitted)
+            .unwrap()
+            .fingerprint()
+            .unwrap(),
+        original.fingerprint().unwrap()
+    );
+}
+
+#[test]
+fn strategy_fingerprint_normalizes_default_and_preserves_selection_semantics() {
+    let base = "      provider: p\n      upstream_model: u";
+    let omitted = Config::from_yaml(&yaml_with_routing(base)).unwrap();
+    let weighted = Config::from_yaml(&yaml_with_routing(&format!(
+        "{base}\n      strategy: weighted"
+    )))
+    .unwrap();
+    assert_eq!(
+        omitted.fingerprint().unwrap(),
+        weighted.fingerprint().unwrap()
+    );
+    let recent = Config::from_yaml(&yaml_with_routing(&format!(
+        "{base}\n      strategy: least_recent"
+    )))
+    .unwrap();
+    let latency = Config::from_yaml(&yaml_with_routing(&format!(
+        "{base}\n      strategy: latency"
+    )))
+    .unwrap();
+    assert_ne!(
+        weighted.fingerprint().unwrap(),
+        recent.fingerprint().unwrap()
+    );
+    assert_ne!(
+        recent.fingerprint().unwrap(),
+        latency.fingerprint().unwrap()
+    );
+    for invalid in ["null", "cooldown", "priority", "{}"] {
+        assert!(
+            Config::from_yaml(&yaml_with_routing(&format!(
+                "{base}\n      strategy: {invalid}"
+            )))
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn provider_transport_fingerprint_normalizes_defaults_and_retains_egress_changes() {
+    let original = valid_config();
+    let baseline = original.fingerprint().unwrap();
+    let mut value = serde_json::to_value(&original).unwrap();
+    value["llm"]["providers"]["openai"]
+        .as_object_mut()
+        .unwrap()
+        .remove("transport");
+    let omitted: Config = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(baseline, omitted.fingerprint().unwrap());
+    value["llm"]["providers"]["openai"]["transport"] = serde_json::json!({});
+    let empty: Config = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(baseline, empty.fingerprint().unwrap());
+    let mut digests = std::collections::BTreeSet::from([baseline]);
+    for transport in [
+        serde_json::json!({"http1_only":true}),
+        serde_json::json!({"proxy_url":"http://proxy.test:8080"}),
+        serde_json::json!({"proxy_url":"http://user:secret@proxy.test:8080"}),
+        serde_json::json!({"proxy_url":"http://user:rotated@proxy.test:8080"}),
+        serde_json::json!({"proxy_url":"http://proxy.test:8080","http1_only":true}),
+    ] {
+        value["llm"]["providers"]["openai"]["transport"] = transport;
+        let changed: Config = serde_json::from_value(value.clone()).unwrap();
+        assert!(digests.insert(changed.fingerprint().unwrap()));
     }
 }

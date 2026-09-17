@@ -25,6 +25,64 @@ curl http://127.0.0.1:19530/v1/chat/completions \
 
 The current ingress implements typed subsets of OpenAI Chat/Embedding, stateless Responses, Anthropic Messages, and Gemini generateContent. Chat supports cross-protocol text, function calls/results and SSE across the four supported Chat API formats. It is not a promise of full vendor API compatibility. By default, unknown or unsupported request fields are rejected with `400` instead of being forwarded. Unsupported upstream response semantics produce `502` before streaming begins, or terminate an SSE stream if they arrive after its validated first frame. The opt-in OpenAI Chat/Responses, Anthropic Messages and Gemini generateContent native modes below preserve vendor JSON fields on matching endpoints. Model names are public aliases: Nyro replaces them with the selected backend's `upstream_model` on the upstream request and restores the public name in typed responses and OpenAI/Anthropic native responses. Gemini native responses preserve `modelVersion` as upstream version metadata.
 
+## Provider network transport
+
+Each Provider can configure its own egress proxy and HTTP version:
+
+```yaml
+llm:
+  providers:
+    example:
+      kind: openai
+      base_url: https://api.example.com/v1
+      transport:
+        proxy_url: http://127.0.0.1:7890
+        http1_only: true
+```
+
+Omitting `transport`, using `{}`, or setting only `http1_only: false` keeps direct connections and normal HTTP version negotiation. `http1_only: true` restricts upstream connections to HTTP/1 independently of whether a proxy is configured. All protocol kinds and native modes use these settings. Rust callers constructing `Provider` must supply `transport: Default::default()` or their chosen `Transport`.
+
+`proxy_url` accepts an explicit HTTP or HTTPS proxy URL with a host, an optional nonzero port, and no path other than `/`, query or fragment. SOCKS, implicit schemes, literal whitespace, unknown fields, wrong types and explicit null values are rejected. Optional URL user information supplies proxy Basic authentication; percent-encode reserved characters in credentials (for example, `p%40ss` for `p@ss`). Configuration serialization contains these credentials; Debug output, gateway error responses and Nyro events redact the proxy address and credentials. No environment-variable expansion is performed.
+
+Both direct and explicit-proxy connections ignore automatic environment/system proxies, including `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` bypass rules. An HTTP target uses proxy forwarding; an HTTPS target uses CONNECT and normal upstream TLS verification. An `https://` proxy URL also encrypts the connection to the proxy. Caller credentials are never forwarded. Provider credentials authenticate the upstream; proxy credentials authenticate the forwarding request or CONNECT, and are not added to the tunneled upstream request. An HTTP forwarding proxy necessarily sees the HTTP upstream request.
+
+Proxy failure does not silently switch that Provider to direct access. Existing configured backend failover remains available within the runtime's attempt budget. Redirects and automatic Reqwest retries remain disabled, and the same logical-request deadline covers connection setup, all attempts and response delivery.
+
+These settings support SIGHUP reload. Changing the proxy address, proxy credentials or HTTP mode resets the affected backend's health and routing history; model rate, subject windows and quota retain their existing state. New requests use the new client while admitted SSE streams finish on their original generation. Invalid settings reject the candidate and retain the active generation. Omitted/empty/default transport settings have the same fingerprint. Proxy URL spelling is retained in the fingerprint, so equivalent spellings can publish a new generation; history identity uses the normalized URL and remains shared when its effective binding is unchanged.
+
+## HTTP deployment migration
+
+The file proxy has no CORS layer or origin allowlist setting. Browser cross-origin access requires a separate deployment decision; legacy wildcard/Tauri defaults are not imported. Use `GET /healthz` for liveness and `/readyz` for whether the Host accepts new generation leases; check the status code, as their bodies are empty. Legacy `/health` and `/` aliases return `404`. Readiness does not test Provider availability or a database.
+
+The defaults remain `server.max_body_bytes: 1048576` (1 MiB), `max_response_bytes: 16777216` (16 MiB), `max_frame_bytes: 1048576` (1 MiB), and `request_timeout_ms: 120000`. Set explicit values when migrating deployments that need the legacy 100 MiB request limit or a longer deadline; the deadline covers the whole logical request, not just one upstream call. Query credentials remain rejected; use the documented protocol-specific credential headers.
+
+Local regression: build with `cargo build -p nyro`, then run `python3 tests/proxy_network_smoke.py`. It covers HTTP/HTTPS proxies, CONNECT authentication, HTTP/1 ALPN, environment isolation, redirects, deadlines, probes/CORS and reload with an active stream and consumed quota. The checked-in TLS key is a public test fixture; only the test child process trusts its certificate.
+
+## API key lifecycle
+
+`security.api_keys` accepts optional `enabled` and `expires_at` fields:
+
+```yaml
+security:
+  api_keys:
+    - id: deploy
+      secret: replace-with-client-secret
+      enabled: true
+      expires_at: 1893456000
+```
+
+`enabled` defaults to `true`; `false` prevents new authentication. `expires_at` is a UTC Unix timestamp in whole seconds (a nonnegative integer; the example is 2030-01-01 00:00:00 UTC). Omission or `null` means no expiry; `0` is already expired. It is not milliseconds, a duration or a date string. The key becomes invalid at `expires_at`, without SIGHUP or a background timer. Invalid field types reject the entire configuration. Disabled or expired keys still participate in duplicate ID/secret validation and retain model `subjects` bindings.
+
+Model discovery, all four Chat APIs, Embedding and matching native mode share this authentication rule. A supplied disabled or expired key returns a generic `401`, including on anonymous models; invalid credentials do not fall back to anonymous access. These authentication failures neither dispatch upstream nor consume concurrency, rate or quota. Omitting credentials still follows the model's anonymous-access setting.
+
+Changing `enabled` or setting, extending or removing `expires_at` requires publishing the configuration (SIGHUP in file mode). These values enter the configuration fingerprint; current time does not. Reloading an identical file remains `unchanged` even after expiry. Disabling, renewing or removing expiry preserves the subject and model bindings; failed reloads retain the active configuration.
+
+A request selects its configuration generation on entry and checks the current system time at authentication, after reading the request body. A slow upload that entered before a reload retains the old generation's key settings, but is rejected if that key expires while its body is being read. Once authenticated and admitted, requests (including SSE) continue through later expiry or reload-based disabling, subject to the existing deadline, cancellation and generation cleanup contracts. Checks use the system wall clock; a clock rollback is evaluated afresh rather than setting a permanent expired flag. Expiring keys fail authentication when the supplied time precedes the Unix epoch.
+
+Rust callers constructing `nyro_security::ApiKey` must supply `enabled: true` and `expires_at: None` (or their desired values). `ApiKeys::authenticate()` uses system time; `authenticate_at(secret, SystemTime)` accepts a caller-supplied time. Authenticate every new operation rather than caching the returned `Identity` as a live key status. The security crate has no LLM, HTTP, database or kernel dependency. The `ApiKeys` registry retains no plaintext secret.
+
+Validation: `cargo test -p nyro-security -p nyro-config`, `cargo test -p nyro-llm --test responses_runtime api_key_lifecycle`, and, after building the root binary, `python3 tests/proxy_reload_smoke.py`.
+
 ## List available models
 
 `GET /v1/models` lists the configured public model aliases visible to the caller, in ascending alias order:
@@ -55,7 +113,7 @@ The signal handler is registered before readiness. Each reload reads the origina
 
 A reload validates the whole file, checks settings that require restart, then compares the effective configuration fingerprint. Equivalent configurations skip candidate construction and keep the same generation. Valid changes build a candidate and publish it atomically: new requests use the new generation, while in-flight requests retain their original routing, credentials, response limits and deadline through body cleanup. Removing a model or rotating a key does not revoke already admitted work. Failed reads, validation, candidate construction or activation leave the current generation serving traffic. Shutdown cancels pending reload activation before kernel cleanup; reload publication uses a ten-second deadline.
 
-`server.listen` and `limit.concurrency` require restart. Other supported request settings, routes, providers and credentials can reload. Unchanged rate/quota policies retain their counters; changing active rate policies or live/consumed quota policies still rejects the candidate as documented below. Health state is reused only for unchanged backend identities. Reload does not clear process-local budgets or force old streams to finish.
+`server.listen` and `limit.concurrency` require restart. Other supported request settings, routes, providers and credentials can reload. Unchanged model rate, subject-window and quota policies retain their counters. Changing active model rate rules, active/unexpired subject-window rules or live/consumed quota rules rejects the candidate as documented below. Health state is reused only for unchanged backend identities. Reload does not clear process-local budgets or force old streams to finish.
 
 `nyro::reload` events report `outcome=applied` or `unchanged` with a numeric generation ID. Rejection events use `outcome=rejected` and a safe reason:
 
@@ -64,7 +122,7 @@ A reload validates the whole file, checks settings that require restart, then co
 | `read_failed` | Restore a readable configuration file |
 | `invalid_config` | Correct YAML, unknown fields, references or invalid values |
 | `restart_required` | Restore the listener/concurrency settings, or restart to change them |
-| `candidate_rejected` | Check active rate/quota policy changes and runtime construction constraints |
+| `candidate_rejected` | Check active model rate, active/unexpired subject-window or live/consumed quota policy changes and runtime construction constraints |
 | `activation_failed` / `interrupted` | Check shutdown/deadline conditions before retrying |
 
 Reload logs exclude configuration contents, file paths, fingerprints and detailed error chains. A rejected file is not rewritten; correct it and send another signal. Regression: `cargo test -p nyro reload::tests` and `python3 tests/proxy_reload_smoke.py` after building the root binary.
@@ -85,6 +143,7 @@ Gemini upstream model names accept a single ASCII letter/digit/`-_.` segment, op
 Each model declares:
 
 - `backends`: a nonempty list of upstream backends. Each has a model-scoped, unique, nonblank `id`, a `provider` ID from `llm.providers`, an `upstream_model`, and an optional integer `weight` (default `100`), and `priority` (default `0`, smaller values preferred).
+- `strategy`: optional `weighted` (default), `least_recent`, or `latency`, selecting within the lowest available priority. Null, unknown names, and the legacy `cooldown` name are rejected.
 - `max_attempts`: positive integer, default `1`, including the first upstream send. Each backend ID is attempted at most once per request.
 - `health`: optional passive breaker policy, disabled when omitted. An empty object enables `failure_threshold: 3` and `cooldown_ms: 30000`; both must be positive.
 - `rate`: optional per-model request frequency; omitted means disabled. See [Request rate](#request-rate).
@@ -112,7 +171,23 @@ chat-default:
   subjects: [local-client]
 ```
 
-Authentication, authorization, and shared admission apply once to the public model. Nyro then prepares each enabled backend locally using its strict codec or the native mode below, excludes backends that cannot represent the request, and selects from the lowest available `priority`, randomly in proportion to weight within that priority. The weights apply to the eligible subset; they are not per-batch traffic guarantees. Preparation sends no network requests. If none can represent the request, the response is `400` and no upstream is called. For example, without a token limit an Anthropic backend is ineligible while a compatible OpenAI backend can still be selected. Preparation cannot determine actual provider availability or whether its eventual response is convertible.
+Authentication, authorization, and shared admission apply once to the public model. Nyro then prepares each enabled backend locally using its strict codec or the native mode below, excludes backends that cannot represent the request, and selects from the lowest available `priority` using the model's `strategy`. The default `weighted` strategy chooses randomly in proportion to weight. These weights apply to the eligible subset; they are not per-batch traffic guarantees. Preparation sends no network requests. If none can represent the request, the response is `400` and no upstream is called. For example, without a token limit an Anthropic backend is ineligible while a compatible OpenAI backend can still be selected. Preparation cannot determine actual provider availability or whether its eventual response is convertible.
+
+All three strategies respect protocol compatibility, zero-weight disabling, health and priority. Exploration never bypasses these filters or selects a larger priority while a smaller one is available.
+
+| `strategy` | Selection within a priority |
+|---|---|
+| `weighted` | Random choice proportional to positive weight. |
+| `least_recent` | Prefer the backend whose attempt was started least recently, with never-attempted backends first; break ties by weight. Selection, health probe acquisition, token admission and dispatch recording are synchronous within a model, with no lock held while awaiting upstream. |
+| `latency` | Give each never-attempted backend an initial sampling opportunity. When successful samples exist, normally prefer the lowest response-header latency EMA; with 5% probability, explore the least recently started candidate. Break ties by weight. Unsampled backends with pending attempts are excluded from that exploration. If no successful samples exist, prefer fewer pending attempts, then least recent dispatch, then weight. |
+
+Latency measures each individual send through receipt of upstream `2xx` headers. The first sample initializes the EMA; subsequent samples contribute 20%. It excludes authentication, earlier retries, JSON body reads and SSE first-frame/subsequent consumption, and does not measure time to first token. A later invalid body does not undo the header sample; health still independently validates the complete response. Non-`2xx`, connection failures, cancellation/deadline before headers produce no sample. Previously attempted backends without successful samples are resampled through exploration instead of continuously displacing working ones. Exploration is probabilistic, with no fixed request-count guarantee for recovery sampling.
+
+All three strategies collect dispatch history and header samples, allowing strategy changes to use existing observations. Rejected token admission does not change history. Once dispatched, errors and cancellation retain dispatch order; pending sampling counts are released on headers or attempt exit. These counts cover header acquisition only, not the full SSE lifetime, and do not introduce another concurrency limit.
+
+The root composition shares history across generations through `SharedResources.routing`, scoped to the public model and effective backend binding. Changes to weight, priority, list order, selection strategy or health policy retain routing history. Provider ID/URL/API/credentials/native mode, upstream model or backend ID changes get a fresh binding; public models remain isolated. Removed bindings can be reclaimed after old generations and attempts release them. Re-adding a binding after its last holder drops starts fresh, as does restarting the process. History retention does not require `health` to be enabled.
+
+When migrating legacy Server configuration, normalize all priorities to `0` for legacy `weighted`. If legacy `priority` relied on input order within a level, assign distinct priorities; map signed priorities to nonnegative levels preserving relative order. `least_recent` replaces legacy `cooldown`'s last-success timestamp and 60-second cap with dispatch order. Legacy `latency`'s mixed timing and global samples are not imported. Legacy non-weighted strategies could still select zero-weight targets; the new runtime consistently disables them, so set positive weights for targets that must remain enabled. Configure health and retry limits separately: selection strategy names do not enable either feature.
 
 By default, each invocation makes one upstream attempt. Setting `max_attempts` above `1` enables failover to another eligible backend after a connection-establishment failure or an upstream HTTP `429`, `500`, `502`, `503`, `504`, or `529`. Remaining backends at the same priority are tried before larger priorities. Skipped incompatible, disabled, or unhealthy backends do not consume the budget. There is no backoff or separate attempt timeout: all attempts share one whole-request deadline and concurrency permit. A slow attempt can exhaust that deadline before failover is possible. Cancellation or dropping the request/body stops owned work.
 
@@ -174,6 +249,63 @@ Excess requests receive a sanitized `429` in their native error format and an in
 The root composition shares rate state across configuration generations. An unchanged public-model rule retains its balance when routes, provider credentials, or other settings change. Changing a rule while its old binding is active rejects candidate construction; restart the process to change its parameters. Removing/disabling a rule lets existing generations finish with their binding, which is released after its last owner drops. A fresh binding or process restart starts with the configured burst capacity; no rate state is persisted. Use SIGHUP on Unix to reload other supported file changes.
 
 The reusable primitive is `nyro_limit::rate::RateLimit`. It accepts counts, a `Duration`, and burst capacity, and returns either admission or a retry delay. It contains no LLM, authentication, HTTP, kernel, or database types; the application owns scope mapping and rejection formatting. Regression: `cargo test -p nyro-limit` and `cargo test -p nyro-llm --test rate_runtime`.
+
+## Subject request windows
+
+Configure rolling request limits under `llm.subject_limits`, keyed by an existing `security.api_keys[].id`. Merge this fragment into the same `llm` mapping as `providers` and `models`:
+
+```yaml
+llm:
+  subject_limits:
+    deploy:
+      rpm: 60
+      rpd: 1000
+```
+
+A request-only policy requires `rpm` or `rpd`; a token-only policy is also valid (see below). Each supplied request count is a positive `u32`; zero, explicit `null`, an empty policy, unknown fields, blank IDs and unknown subjects reject configuration. Omitting a subject's policy disables its request windows. Disabled or expired keys remain valid policy references. Limits are LLM policy, separate from authentication fields on an API key.
+
+RPM counts admissions in the preceding 60 seconds; RPD counts admissions in the preceding 24 hours, with an admission expiring at exactly its window duration. RPD does not reset at midnight. These are exact rolling counts using a monotonic clock, so wall-clock adjustments do not refill them. Each window allows its full count immediately when empty. Add a model token bucket when you also need to smooth bursts.
+
+All configured LLM model aliases, supported APIs, workloads, and strict/native paths share the window for that authenticated subject. Different subjects have independent windows. Rotating a secret while preserving its ID preserves the budget; choosing a new ID creates a different subject. Anonymous calls have no subject window and remain subject to the model bucket. Supplied credentials must still authenticate, and an authenticated caller uses its subject windows even on an anonymous model. Model discovery does not consume request limits.
+
+At the existing request-rate admission step, Nyro checks the subject's windows and the model bucket atomically: rejection charges none of these request rules. A native `429` releases concurrency immediately without calling upstream. `Retry-After` rounds up to seconds and reports the longest blocked subject window, or the bucket delay when all subject windows permit admission. It is advisory; after that wait a different rule or caller may still prevent admission. Validation, authentication, authorization, concurrency rejection, incompatible-backend preparation and cancellation/deadline checks before this step consume nothing. Once admitted, a logical request counts once across all retries; upstream errors, no healthy backend, later token-quota rejection, cancellation and body/stream loss do not refund it.
+
+The root proxy shares histories through `runtime::SharedResources` across reloads and overlapping generations. Rotation, disable/re-enable, expiry/renewal and subject/policy removal/re-addition preserve unexpired admissions for the same ID. Removing a policy stops counting new requests against it; it does not erase prior history. A live binding or unexpired history rejects a candidate that changes its window parameters. Restart to change an established rule immediately; inactive histories with all admissions expired are reclaimed on a subsequent policy bind. Failed candidates do not reset active budgets or retain unused bindings indefinitely. An in-flight request keeps its original generation's policies.
+
+Counters are process-local and reset on restart; replicas do not coordinate them. TPM/TPD are configured separately below; persistent counters remain unimplemented. Historical log counts are not imported: this counts logical admissions, not log completions. The shared primitive `nyro_limit::request::RequestLimit` accepts `(count, Duration)` windows and an optional `RateLimit` for atomic composition. `nyro_llm::subject_limit::SubjectLimitRegistry` supplies subject scope. Neither introduces HTTP, LLM or database types into `nyro-limit`, or responsibilities into the kernel. Rust callers constructing `config::Config` must supply `subject_limits` (an empty map preserves prior behavior); callers constructing every `SharedResources` field must also supply its registry or use `..Default::default()`.
+
+Regression: `cargo test -p nyro-limit` and `cargo test -p nyro-llm --test rate_runtime`; the root reload smoke covers rotation, rejected changes, disable/re-enable and removal/re-addition.
+
+## Subject token windows
+
+The same `llm.subject_limits` policy can enable TPM/TPD, with or without RPM/RPD:
+
+```yaml
+llm:
+  subject_limits:
+    deploy:
+      tpm: 100000
+      tpd: 1000000
+      reserve_tokens: 4096
+```
+
+`tpm` and `tpd` are optional positive `u64` limits for normalized input plus output tokens. Configuring either requires a positive `reserve_tokens` no greater than every configured token limit. A reservation without a token window, zero, explicit `null`, invalid types and unknown fields reject configuration. Request limits and token limits may coexist; at least one of `rpm`, `rpd`, `tpm` or `tpd` must be configured. Model `quota.reserve_tokens` and subject `reserve_tokens` are separate settings and may differ. Rust `SubjectLimitConfig` literals must provide the new `tpm`, `tpd` and `reserve_tokens` fields; use `None` for existing request-only policies.
+
+Nyro reserves subject tokens immediately before each selected upstream attempt, after logical request-rate admission and backend health selection. All subject token windows and an optional cumulative model quota reserve atomically; rejection leaves both token budgets unchanged, sends no new upstream request and releases concurrency. Already admitted RPM/RPD/model-rate units remain charged. Each retry needs its own token reservation, while its logical request still counts once. A request with no eligible healthy backend has no token reservation.
+
+Pending reservations count against every token window until settled or released. They do not expire while a long request or SSE stream is running. On validated upstream protocol completion, actual usage replaces the reservation, including explicit zero or usage above the reserve. Each positive settlement enters the rolling windows at its settlement time and expires exactly 60 seconds (TPM) or 24 hours (TPD) later. There is no midnight reset. This deliberately measures settled attempt usage plus all pending reservations; it does not pretend to know when each upstream token was generated. A stream that crosses a minute boundary keeps its pending units and starts the settled-usage window when it finishes.
+
+Known connection-establishment failures release both reservations. HTTP errors, transport/protocol failures, cancellation, deadline, truncation and response-body/future drop settle the greater of that budget's reservation and the highest valid observed usage. Complete responses without usage use the same fallback. Model and subject budgets each apply their own reserve, so unknown outcomes can charge different amounts. Complete usage settles each budget to the same actual amount without adding the two together. Cumulative stream snapshots replace prior values rather than accumulating them; invalid/decreasing snapshots cannot reduce an existing charge. Successful protocol completion is final: subsequent downstream delivery loss does not settle twice.
+
+The reservation is an operator-selected provision, not a trusted upper bound on vendor consumption. Actual usage may exceed a window limit; Nyro records the debt and blocks later reservations until enough settled usage expires. It does not truncate an admitted stream merely because observed usage exceeds its reserve. Unknown outcomes can be overcounted. These windows control admission using reported or fallback usage, not a hard cap on actual upstream token generation.
+
+Subject token rejection uses the native `429` format (`rate_limit_exceeded` for OpenAI APIs). When settled usage can expire to make room, `Retry-After` is the longest wait needed across blocked windows, rounded up to seconds; it may need several settlement records to expire. When pending units alone prevent admission, the header is omitted because their completion time is unknown. A later retry may still be blocked by new traffic or settlements. Cumulative model quota rejection retains `quota_exceeded` with no retry header. Anthropic uses `rate_limit_error`; Gemini uses `RESOURCE_EXHAUSTED`.
+
+Subject scope and lifecycle match request windows: all model aliases, supported APIs/workloads and strict/native paths share the authenticated subject's state. Anonymous calls have no subject token budget, and supplying a valid credential on an anonymous model still applies its policy. Reload, secret rotation, disable/re-enable, expiry/renewal and removal/re-addition retain pending tokens and unexpired settled usage. Any active binding, pending receipt or unexpired request/token history prevents changing that subject's policy parameters, including adding a token rule to an active request-only policy; the candidate is rejected. Restart to change such a policy immediately. An inactive policy is reclaimable on a later bind once both request history and token usage are empty and no reservation remains. Failed candidates cannot reset active counters.
+
+`nyro_limit::window::WindowQuota` is a generic unit budget, with no LLM, authentication, HTTP, storage or kernel types. `SubjectLimitRegistry::token_snapshots` reports configured token windows in TPM-then-TPD order. Request/attempt logs expose `token_window_charged_tokens` separately from `quota_charged_tokens` and reported `total_tokens`; attempt `token_window_outcome` distinguishes `actual`, `fallback`, `released` and `disabled`. A subject charge is counted once even when both TPM and TPD are enabled. Counters remain process-local, reset on restart and are not imported from legacy logs. Persistence and multi-replica coordination remain deferred.
+
+Regression: `cargo test -p nyro-limit`, `cargo test -p nyro-llm --test quota_runtime --test observation_runtime`, and the root reload smoke after building `nyro`.
 
 ## Token quota
 
@@ -484,7 +616,7 @@ Events contain no credentials, provider URLs, request paths, client-supplied IDs
 - `GET /healthz` returns `200` while the HTTP process is serving.
 - `GET /readyz` returns `200` while the kernel host accepts new generation leases and `503` once it does not. This source-built proxy has no database or upstream-backend readiness check.
 
-Retries and passive health are opt-in as described above. It does not implement persistent/shared quota storage, a control plane, Admin API, WebUI, `nyro serve`, or `nyro tool`. It does not expand environment variables, accept the legacy standalone YAML format, watch the file automatically, or fetch configuration remotely. Unix supports explicit SIGHUP reload; unsupported setting changes require restart.
+Retries and passive health are opt-in as described above. File mode has no control plane or Admin API. The separate [experimental `nyro serve`](rust-serve.md) adds local SQLite configuration management and publication. Persistent/shared quota storage, WebUI and `nyro tool` remain unimplemented. It does not expand environment variables, accept the legacy standalone YAML format, watch the file automatically, or fetch configuration remotely. Unix supports explicit SIGHUP reload; unsupported setting changes require restart.
 
 Contributors can exercise the root process, probes, authentication, Chat, Embedding, SSE, redaction, and graceful termination without a real provider:
 
@@ -492,6 +624,14 @@ Contributors can exercise the root process, probes, authentication, Chat, Embedd
 cargo build -p nyro
 python3 tests/proxy_smoke.py
 ```
+
+## Local multi-turn tool session regression
+
+Run `cargo test -p nyro-llm --test responses_runtime multiturn` for the [session matrix](../../crates/nyro-llm/tests/responses_runtime/multiturn.rs). It appends the actual client-visible JSON or assembled SSE output to the next request: two parallel tool calls, results returned in reverse order, another tool call, then a final answer. Coverage includes strict text conversion among all four APIs, Anthropic/Responses image-result conversion, Gemini image results within the same protocol, and proprietary reasoning combined with images in each of those three protocols. All four APIs also have matching native-mode cases. Each successful session makes three requests, using all JSON, all SSE, or either alternating pattern.
+
+Assertions check the subsequent upstream history for content order, call IDs/arguments, result images and Gemini named references, signatures/encrypted reasoning, model aliases, credential isolation, per-turn usage and concurrency permit release. Missing, duplicate or unknown second-turn results are rejected for Anthropic/Gemini destinations that require complete batches. Incompatible image or reasoning history never dispatches; corrected history or the original protocol can still continue.
+
+The matrix uses local HTTP mocks and a test client, without executing real tools, SDKs or vendor calls or verifying signature authenticity. It provides multi-turn composition regression, not complete client compatibility certification. Versioned real clients, vendor sessions and remaining unsupported semantics still need separate acceptance.
 
 ## Ordered IR migration for Rust callers
 

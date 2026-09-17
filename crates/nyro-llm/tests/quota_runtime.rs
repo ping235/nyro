@@ -204,10 +204,14 @@ fn runtime(
                 ApiKey {
                     id: "alice".into(),
                     secret: "alice-secret".into(),
+                    enabled: true,
+                    expires_at: None,
                 },
                 ApiKey {
                     id: "bob".into(),
                     secret: "bob-secret".into(),
+                    enabled: true,
+                    expires_at: None,
                 },
             ])
             .unwrap(),
@@ -878,3 +882,6 @@ async fn aliases_have_independent_quotas_and_omission_disables_accounting() {
     assert!(resources.quotas.snapshot("unlimited").is_none());
     assert_eq!(upstream.count(), 4);
 }
+
+#[path = "quota_runtime/token_windows.rs"]
+mod token_windows;

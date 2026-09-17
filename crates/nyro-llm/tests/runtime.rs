@@ -76,9 +76,11 @@ use futures::StreamExt;
 
 fn runtime(upstream: &Upstream, limit: ConcurrencyLimit, options: Options) -> Runtime {
     let config = config::Config {
+        subject_limits: BTreeMap::new(),
         providers: BTreeMap::from([(
             "upstream".into(),
             config::Provider {
+                transport: Default::default(),
                 native_chat: false,
                 kind: config::ProviderKind::Openai,
                 api: None,
@@ -89,6 +91,7 @@ fn runtime(upstream: &Upstream, limit: ConcurrencyLimit, options: Options) -> Ru
         models: BTreeMap::from([(
             "public-model".into(),
             config::Model {
+                strategy: Default::default(),
                 max_attempts: 1,
                 health: None,
                 rate: None,
@@ -110,10 +113,14 @@ fn runtime(upstream: &Upstream, limit: ConcurrencyLimit, options: Options) -> Ru
         ApiKey {
             id: "alice".into(),
             secret: "client-secret".into(),
+            enabled: true,
+            expires_at: None,
         },
         ApiKey {
             id: "bob".into(),
             secret: "other-secret".into(),
+            enabled: true,
+            expires_at: None,
         },
     ])
     .unwrap();

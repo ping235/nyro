@@ -84,9 +84,11 @@ fn rate_policy_defaults_to_one_burst_and_omission_disables_it() {
 
 fn valid_config() -> Config {
     Config {
+        subject_limits: BTreeMap::new(),
         providers: BTreeMap::from([(
             "openai".into(),
             Provider {
+                transport: Default::default(),
                 native_chat: false,
                 kind: ProviderKind::Openai,
                 api: None,
@@ -97,6 +99,7 @@ fn valid_config() -> Config {
         models: BTreeMap::from([(
             "chat".into(),
             Model {
+                strategy: Default::default(),
                 max_attempts: 1,
                 health: None,
                 rate: None,
@@ -481,6 +484,105 @@ fn rate_policy_accepts_large_bounds_and_burst_independent_of_refill_count() {
         let mut value = serde_json::to_value(valid_config()).unwrap();
         value["models"]["chat"]["rate"] = policy;
         serde_json::from_value::<Config>(value)
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+}
+
+#[test]
+fn subject_token_windows_accept_standalone_and_combined_request_rules() {
+    for policy in [
+        serde_json::json!({"tpm":100,"reserve_tokens":10}),
+        serde_json::json!({"tpd":1000,"reserve_tokens":10}),
+        serde_json::json!({"rpm":2,"rpd":10,"tpm":100,"tpd":1000,"reserve_tokens":10}),
+    ] {
+        let mut value = serde_json::to_value(valid_config()).unwrap();
+        value["subject_limits"] = serde_json::json!({"alice":policy});
+        let parsed = serde_json::from_value::<Config>(value);
+        assert!(parsed.is_ok(), "{parsed:?}");
+        parsed.unwrap().validate().unwrap();
+    }
+}
+
+#[test]
+fn subject_token_windows_reject_invalid_or_unusable_reservations() {
+    for policy in [
+        serde_json::json!({"tpm":0,"reserve_tokens":1}),
+        serde_json::json!({"tpm":100}),
+        serde_json::json!({"tpd":100,"reserve_tokens":0}),
+        serde_json::json!({"tpm":100,"tpd":5,"reserve_tokens":10}),
+        serde_json::json!({"tpm":5,"tpd":100,"reserve_tokens":10}),
+        serde_json::json!({"rpm":2,"reserve_tokens":10}),
+        serde_json::json!({"tpm":null,"reserve_tokens":1}),
+        serde_json::json!({"tpd":100,"reserve_tokens":null}),
+        serde_json::json!({"tpd":-1,"reserve_tokens":1}),
+    ] {
+        let mut value = serde_json::to_value(valid_config()).unwrap();
+        value["subject_limits"] = serde_json::json!({"alice":policy});
+        let parsed = serde_json::from_value::<Config>(value);
+        assert!(
+            parsed.is_err() || parsed.unwrap().validate().is_err(),
+            "{policy}"
+        );
+    }
+}
+
+#[test]
+fn provider_transport_defaults_validation_and_diagnostics_are_explicit() {
+    let base = serde_json::to_value(valid_config()).unwrap();
+    let mut input = base.clone();
+    input["providers"]["openai"]["transport"] = serde_json::json!({
+        "proxy_url":"http://proxy-user:proxy-secret@localhost:8080", "http1_only":true
+    });
+    let parsed: Config = serde_json::from_value(input).expect("explicit transport accepted");
+    parsed.validate().unwrap();
+    let debug = format!("{parsed:?}");
+    assert!(
+        !debug.contains("proxy-secret")
+            && !debug.contains("proxy-user")
+            && !debug.contains("localhost")
+    );
+    for transport in [
+        serde_json::json!(null),
+        serde_json::json!({"proxy_url":null}),
+        serde_json::json!({"http1_only":null}),
+        serde_json::json!({"http1_only":"true"}),
+        serde_json::json!({"unknown":true}),
+    ] {
+        let mut input = base.clone();
+        input["providers"]["openai"]["transport"] = transport;
+        assert!(serde_json::from_value::<Config>(input).is_err());
+    }
+    for url in [
+        "",
+        "localhost:8080",
+        "http:localhost",
+        "socks5://localhost:1080",
+        "http://localhost:0",
+        "http://localhost/path",
+        "http://localhost?x=1",
+        "http://localhost#frag",
+        " http://localhost",
+        "http://local\nhost",
+    ] {
+        let mut input = base.clone();
+        input["providers"]["openai"]["transport"] = serde_json::json!({"proxy_url":url});
+        let parsed: Config = serde_json::from_value(input).unwrap();
+        let error = parsed.validate().unwrap_err().to_string();
+        assert!(
+            !error.contains(url) || url.is_empty(),
+            "URL leaked in validation error"
+        );
+    }
+    for url in [
+        "http://localhost:8080",
+        "https://localhost:8443/",
+        "http://user:p%40ss@[::1]:8080",
+    ] {
+        let mut input = base.clone();
+        input["providers"]["openai"]["transport"] = serde_json::json!({"proxy_url":url});
+        serde_json::from_value::<Config>(input)
             .unwrap()
             .validate()
             .unwrap();

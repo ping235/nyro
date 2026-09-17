@@ -25,6 +25,64 @@ curl http://127.0.0.1:19530/v1/chat/completions \
 
 当前入口实现 OpenAI Chat/Embedding、无状态 Responses、Anthropic Messages 和 Gemini generateContent 的强类型子集。Chat 支持四种已支持 Chat API 格式之间的文本、函数调用／结果及 SSE 转换，不承诺完整兼容各厂商 API。默认情况下，未知或尚未支持的请求字段会返回 `400`，不会原样转发；尚未支持的上游响应语义会在流开始前返回 `502`，如果出现在首帧校验后的 SSE 中则终止该流。下文的 OpenAI Chat/Responses、Anthropic Messages 和 Gemini generateContent 原生模式可显式开启，在匹配的端点之间保留厂商 JSON 字段。配置中的模型名是公开别名：Nyro 向上游发送所选 backend 的 `upstream_model`，并在类型化响应及 OpenAI／Anthropic 原生响应中恢复公开模型名；Gemini 原生响应保留 `modelVersion` 作为上游版本信息。
 
+## Provider 网络传输
+
+每个 Provider 可以独立设置出口代理和 HTTP 版本：
+
+```yaml
+llm:
+  providers:
+    example:
+      kind: openai
+      base_url: https://api.example.com/v1
+      transport:
+        proxy_url: http://127.0.0.1:7890
+        http1_only: true
+```
+
+省略 `transport`、配置 `{}` 或仅设置 `http1_only: false`，均保持直连及正常 HTTP 版本协商。`http1_only: true` 将上游连接限制为 HTTP/1，与是否配置代理无关。所有协议 kind 和原生模式共用这些设置。Rust 调用方构造 `Provider` 时需要提供 `transport: Default::default()` 或所需的 `Transport`。
+
+`proxy_url` 只接受显式 HTTP／HTTPS 代理 URL，必须有主机，可选端口必须非零；路径只能为空或 `/`，不能含 query 或 fragment。SOCKS、隐式协议、字面空白、未知字段、错误类型和显式 null 均拒绝。可在 URL 用户信息中提供代理 Basic 认证，凭证中的保留字符需要百分号编码，例如 `p@ss` 写成 `p%40ss`。配置序列化包含这些凭证；Debug、网关错误响应和 Nyro 事件会隐藏代理地址与凭证。配置不会展开环境变量。
+
+直连和显式代理均忽略自动系统／环境代理，包括 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 及 `NO_PROXY` 旁路规则。HTTP 目标使用转发代理，HTTPS 目标通过 CONNECT 建立隧道并正常校验上游 TLS；`https://` 代理 URL 还会加密到代理的连接。调用方凭证不会转发。Provider 凭证用于上游认证，代理凭证用于转发请求或 CONNECT，不加入隧道内的上游请求；HTTP 转发代理必然能看到 HTTP 上游请求。
+
+代理失败不会静默改为同一 Provider 直连。既有其他 backend 故障转移仍服从 runtime 的尝试预算。重定向和 Reqwest 自动重试继续关闭，连接建立、所有尝试和响应交付共用同一逻辑请求期限。
+
+这些设置支持 SIGHUP 重载。代理地址、代理凭证或 HTTP 模式变化会重建受影响 backend 的健康与路由历史；模型 rate、主体窗口和 quota 按原规则保留。新请求使用新客户端，已准入 SSE 使用原代际完成。无效配置拒绝候选并保留活动代际。省略、空对象和默认 transport 的配置指纹一致；代理 URL 的文本写法仍进入指纹，因此等价写法可能发布新代际，但历史身份使用归一化 URL，有效绑定未变时仍复用历史。
+
+## HTTP 部署迁移
+
+文件代理没有 CORS 层或来源白名单配置。浏览器跨域访问需要单独确定部署方案，不导入旧通配符／Tauri 默认值。存活检查使用 `GET /healthz`，是否接受新代际 lease 使用 `/readyz`；两者正文为空，应检查状态码。旧 `/health` 和 `/` 别名返回 `404`。就绪探针不检查 Provider 可用性或数据库。
+
+默认值继续为 `server.max_body_bytes: 1048576`（1 MiB）、`max_response_bytes: 16777216`（16 MiB）、`max_frame_bytes: 1048576`（1 MiB）和 `request_timeout_ms: 120000`。迁移中需要旧 100 MiB 请求上限或更长期限的部署应显式设置；期限覆盖整个逻辑请求，不仅是单次上游调用。查询参数凭证继续拒绝，改用各协议文档规定的凭证 Header。
+
+本地回归：先执行 `cargo build -p nyro`，再执行 `python3 tests/proxy_network_smoke.py`。覆盖 HTTP／HTTPS 代理、CONNECT 认证、HTTP/1 ALPN、环境隔离、重定向、期限、探针／CORS，以及持有旧流和已消耗额度时的重载。提交的 TLS 密钥是公开测试 fixture，仅测试子进程信任对应证书。
+
+## API Key 生命周期
+
+`security.api_keys` 支持可选的 `enabled` 和 `expires_at`：
+
+```yaml
+security:
+  api_keys:
+    - id: deploy
+      secret: replace-with-client-secret
+      enabled: true
+      expires_at: 1893456000
+```
+
+`enabled` 省略时为 `true`；`false` 禁止新的认证。`expires_at` 是 UTC Unix 秒时间戳（非负整数，示例为 2030-01-01 00:00:00 UTC），省略或 `null` 表示不过期；`0` 表示已过期。它不是毫秒、持续时间或日期字符串。时间达到 `expires_at` 即失效，无需 SIGHUP 或后台定时任务。字段类型错误会拒绝整份配置，禁用或过期的密钥仍参与 ID／secret 重复校验并保留模型 `subjects` 绑定。
+
+模型发现、四种 Chat API、Embedding 以及匹配原生模式使用同一认证规则。提供禁用或过期密钥返回通用 `401`，即使模型允许匿名访问，也不会将无效凭证回退为匿名；这类认证失败不访问上游或消耗并发、rate、quota。省略凭证时仍遵循模型的匿名设置。
+
+修改 `enabled`、设置／延长／移除 `expires_at` 后需要发布配置（文件模式使用 SIGHUP）。这些值参与配置指纹，而当前时间不参与；相同文件即使已经过期，重载也保持 `unchanged`。禁用、续期和移除到期时间保留原主体与模型绑定，失败重载保留活动配置。
+
+请求进入时选定配置代际，读取请求体后在认证时检查当前系统时间。重载前已进入的慢上传仍使用原代际的密钥设置，但如果读取期间超过该设置的到期时间，会在认证时拒绝。认证并准入后的请求（包括 SSE）不因后续到期或重载禁用而中断，继续遵循原有期限、取消和代际清理契约。时间检查使用系统墙钟；回拨后按新的时间重新判断，不维护永久过期标记。对于带到期时间的密钥，时间早于 Unix epoch 时拒绝认证。
+
+Rust 调用方构造 `nyro_security::ApiKey` 时需补充 `enabled: true` 与 `expires_at: None`（或所需值）。`ApiKeys::authenticate()` 使用系统时间，`authenticate_at(secret, SystemTime)` 支持由调用方提供时间；每次新操作均需认证，不应将返回的 `Identity` 当作会自动更新的密钥状态。安全包不依赖 LLM、HTTP、数据库或内核；`ApiKeys` 认证表不保存明文 secret。
+
+验证：`cargo test -p nyro-security -p nyro-config`、`cargo test -p nyro-llm --test responses_runtime api_key_lifecycle`，以及构建根二进制后执行 `python3 tests/proxy_reload_smoke.py`。
+
 ## 查询可见模型
 
 `GET /v1/models` 按别名升序返回调用方可见的已配置公开模型别名：
@@ -55,7 +113,7 @@ kill -HUP "$nyro_pid"
 
 重载先校验整个文件及必须重启的设置，再比较有效配置指纹。等价配置直接跳过候选构建，保持原代际。有效变更构建候选后原子发布：新请求使用新代际，在途请求持有原路由、凭证、响应限制和期限直至响应体清理。移除模型或轮换密钥不会撤销已经准入的工作。读取、校验、候选构建或激活失败时，当前代际继续服务。退出时先取消在途重载激活，再由内核清理；重载发布使用十秒期限。
 
-`server.listen` 和 `limit.concurrency` 必须重启才能修改。其他已支持的请求设置、路由、Provider 和凭证可以重载。rate/quota 规则不变时保留计数；修改活跃 rate 规则或活跃／已消耗 quota 规则仍按下文契约拒绝候选。健康状态只对身份未改变的 backend 复用。重载不清空进程内预算，也不强制结束旧流。
+`server.listen` 和 `limit.concurrency` 必须重启才能修改。其他已支持的请求设置、路由、Provider 和凭证可以重载。模型 rate、主体窗口和 quota 规则不变时保留计数；修改活跃模型 rate、活跃／未过期主体窗口或活跃／已消耗 quota 规则，仍按下文契约拒绝候选。健康状态只对身份未改变的 backend 复用。重载不清空进程内预算，也不强制结束旧流。
 
 `nyro::reload` 事件通过 `outcome=applied` 或 `unchanged` 与数值代际 ID 表示结果。拒绝事件使用 `outcome=rejected`，并给出安全的原因：
 
@@ -64,7 +122,7 @@ kill -HUP "$nyro_pid"
 | `read_failed` | 恢复可读取的配置文件 |
 | `invalid_config` | 修正 YAML、未知字段、引用或无效值 |
 | `restart_required` | 恢复原监听／并发设置，或重启以修改它们 |
-| `candidate_rejected` | 检查活跃 rate/quota 规则变更及运行时构建约束 |
+| `candidate_rejected` | 检查活跃模型 rate、活跃／未过期主体窗口或活跃／已消耗 quota 规则变更及运行时构建约束 |
 | `activation_failed` / `interrupted` | 检查退出／期限状态后再重试 |
 
 重载日志不包含配置正文、文件路径、指纹或详细错误链。被拒绝的文件不会被写回，修正后重新发送信号即可。回归测试：`cargo test -p nyro reload::tests`；构建根二进制后执行 `python3 tests/proxy_reload_smoke.py`。
@@ -85,6 +143,7 @@ Gemini 上游模型名只接受由 ASCII 字母、数字、`-_.` 构成的单段
 每个模型包含：
 
 - `backends`：非空上游列表。每项包含模型范围内唯一且非空白的 `id`、`llm.providers` 中的 `provider` ID、`upstream_model`，以及可选整数 `weight`（默认 `100`）和 `priority`（默认 `0`，数值越小越优先）。
+- `strategy`：可选 `weighted`（默认）、`least_recent` 或 `latency`，决定最小可用优先级内的选择方式；拒绝 null、未知名称和旧 `cooldown` 名称。
 - `max_attempts`：正整数，默认 `1`，包含首次上游发送。每个请求最多尝试每个 backend ID 一次。
 - `health`：可选的被动熔断策略，省略时关闭。空对象启用默认值 `failure_threshold: 3` 和 `cooldown_ms: 30000`，两者必须大于零。
 - `rate`：可选的模型请求频率，省略时关闭。见下文“请求频率”。
@@ -112,7 +171,23 @@ chat-default:
   subjects: [local-client]
 ```
 
-认证、授权和共享准入针对公开模型执行一次。随后 Nyro 使用各 backend 对应的严格 codec 或下文的原生模式在本地准备请求，排除无法表达当前请求的项，从当前可用的最小 `priority` 中按权重随机选择一个。权重作用于可用候选集合，不保证每一批请求都严格按比例分配。准备阶段不发送网络请求；没有可表达请求的 backend 时返回 `400`。例如请求未提供 token 上限时，Anthropic backend 不参与选择，而兼容的 OpenAI backend 仍可参与。准备阶段不能确定 Provider 的实际可用性，也不能保证其后续响应可转换。
+认证、授权和共享准入针对公开模型执行一次。随后 Nyro 使用各 backend 对应的严格 codec 或下文的原生模式在本地准备请求，排除无法表达当前请求的项，从当前可用的最小 `priority` 中按模型 `strategy` 选择一个。默认 `weighted` 按权重随机，权重作用于可用候选集合，不保证每一批请求都严格按比例分配。准备阶段不发送网络请求；没有可表达请求的 backend 时返回 `400`。例如请求未提供 token 上限时，Anthropic backend 不参与选择，而兼容的 OpenAI backend 仍可参与。准备阶段不能确定 Provider 的实际可用性，也不能保证其后续响应可转换。
+
+三种选择策略都遵守协议兼容、零权重禁用、健康检查和优先级；新策略不会借探索访问更低优先级、禁用或不兼容的目标。
+
+| `strategy` | 同级候选选择 |
+|---|---|
+| `weighted` | 按正权重随机。 |
+| `least_recent` | 最久未发起尝试的 backend 优先，未尝试过的优先；并列按权重。选择、健康探测认领、token 预算准入和发起记录在同一模型内同步完成，等待上游期间不持锁。 |
+| `latency` | 每个从未尝试的 backend 先获得一次采样机会；存在成功样本时，通常选择响应头耗时 EMA 最小者，另有 5% 概率探索最久未发起的候选，并列按权重。无成功样本且已有在途尝试的目标暂不参与这次探索；若全部没有成功样本，则按在途尝试数、最近发起顺序、权重依次选择。 |
+
+延迟样本只统计单次发送开始至收到上游 `2xx` 响应头的耗时，首个样本初始化 EMA，后续新样本占 20%。不包含鉴权、此前重试、JSON 响应体读取或 SSE 首帧／后续流消费，也不表示首 token 延迟。响应体随后无效也不会撤销响应头样本；健康状态仍独立按完整响应校验更新。非 `2xx`、建连失败、响应头前取消／期限耗尽不产生样本；已尝试但没有成功样本的目标通过后续探索重新采样，不无限抢占正常目标。探索是概率行为，不承诺固定请求次数内完成恢复采样。
+
+选择历史在所有三种策略下记录，因此切换策略可使用已有发起记录和响应头样本。未通过预算准入的选择不更新历史；实际发起后，即使错误或取消也保留发起顺序，在途采样计数在响应头到达或尝试退出时释放。这里的在途计数只用于响应头采样，不是完整 SSE 并发数，也不是新的并发限制。
+
+根组合层通过 `SharedResources.routing` 按公开模型和有效 backend 绑定跨代际共享历史。权重、优先级、列表顺序、选择策略或健康策略变化保留路由历史；Provider ID/URL/API/凭证/原生模式、上游模型或 backend ID 变化使用新绑定，不同公开模型相互隔离。旧代际和尝试释放后，已移除绑定可回收；没有持有者后再加回会重新采样，进程重启也会清空。历史保留不要求启用 `health`。
+
+迁移旧 Server 配置时，旧 `weighted` 的所有 priority 应统一为 `0`；旧 `priority` 若依赖同级传入顺序，应给目标分配不同 priority。旧有符号优先级需按相对顺序映射为非负层级。旧 `cooldown` 的最近成功使用及 60 秒截断由 `least_recent` 的每次发起顺序替代；旧 `latency` 的混合耗时与全局样本不迁入。旧非 weighted 策略可能仍选择零权重目标，新版统一禁用；需要继续启用的目标必须显式设置正权重。健康检查与重试需分别显式配置，不能将这些策略名称当作健康策略或重试开关。
 
 默认每次调用只尝试一个上游。将 `max_attempts` 设置为大于 `1` 后，连接建立失败或上游返回 HTTP `429`、`500`、`502`、`503`、`504`、`529` 时，可以切换到其他候选。先尝试同一优先级的剩余 backend，再考虑更大的优先级。跳过不兼容、禁用或不健康的 backend 不消耗预算。当前没有退避和独立的单次尝试超时；所有尝试共享整个请求期限与同一个并发许可。单个慢请求可能耗尽期限而无法故障转移。取消或丢弃请求／响应体会停止其持有的工作。
 
@@ -174,6 +249,63 @@ rate:
 根组合层在配置代际之间共享 rate 状态。公开模型的规则不变时，修改路由、Provider 凭证或其他设置不会重置余额。旧规则绑定仍活跃时，修改其参数会使候选构建失败；更改参数需要重启进程。移除或关闭规则后，旧代际仍按原绑定完成，最后一个持有者释放时回收状态。新绑定或新进程以配置的突发容量启动，不持久化计数。Unix 上其他已支持的文件修改可通过 SIGHUP 重载。
 
 可复用原语为 `nyro_limit::rate::RateLimit`，接收数量、`Duration` 与突发容量，返回准入结果或建议等待时长，不依赖 LLM、认证、HTTP、内核或数据库类型；作用域映射与协议拒绝结果由应用决定。回归测试：`cargo test -p nyro-limit` 和 `cargo test -p nyro-llm --test rate_runtime`。
+
+## 主体请求窗口
+
+在 `llm.subject_limits` 下按已有的 `security.api_keys[].id` 配置滚动请求限制。将下面片段合入包含 `providers` 和 `models` 的同一个 `llm` 映射：
+
+```yaml
+llm:
+  subject_limits:
+    deploy:
+      rpm: 60
+      rpd: 1000
+```
+
+仅请求窗口策略至少配置 `rpm` 或 `rpd` 一项；也允许仅配置下文的 token 窗口。提供的请求次数必须是正 `u32`。零、显式 `null`、空策略、未知字段、空白 ID 和未知主体均拒绝配置。省略某主体的策略表示不启用其请求窗口。禁用或已过期的密钥仍可作为合法策略引用。限制属于 LLM 策略，与 API Key 上的认证字段分开。
+
+RPM 统计最近 60 秒内的准入，RPD 统计最近 24 小时内的准入；记录达到对应窗口时长时立即过期，RPD 不在午夜清零。窗口按单调时钟精确计数，调整墙钟不会补充预算。空窗口允许立即用完全部次数；如需平滑突发，可同时配置模型令牌桶。
+
+同一认证主体在所有已配置 LLM 模型别名、已支持 API、工作负载和严格／原生路径中共享窗口，不同主体相互独立。保留 ID 轮换 secret 会保留预算，改用新 ID 则属于另一个主体。匿名请求没有主体窗口，仍受模型令牌桶限制；提供凭证时必须认证成功，认证用户访问匿名模型也受其主体窗口限制。模型发现不消耗请求预算。
+
+在现有请求频率准入位置，主体的各窗口与模型令牌桶原子检查和扣减，任意请求规则拒绝都不扣减其他请求规则。拒绝返回原生协议 `429`，立即释放并发许可，不调用上游。`Retry-After` 向上取整为秒：主体窗口阻塞时取最长等待，主体窗口均放行时返回令牌桶等待。该值仅供参考，等待后仍可能受另一规则或其他调用方影响。此阶段之前的校验、认证、授权、并发拒绝、不兼容 backend 准备以及取消／超时检查不计数。准入后的逻辑请求跨全部重试只计一次；上游错误、没有健康 backend、后续 token quota 拒绝、取消和响应体／流丢失均不退款。
+
+根代理通过 `runtime::SharedResources` 在重载和重叠代际之间共享历史。轮换、禁用／重新启用、到期／续期以及主体／策略移除后重新加入，均保留同一 ID 尚未过期的准入记录。移除策略会停止新请求的对应计数，但不删除历史。规则仍有活跃绑定或未过期历史时，修改窗口参数会拒绝候选；需要立即修改已建立的规则时重启进程。没有活跃绑定且全部记录过期后，在后续策略绑定时回收。失败候选不会重置现役预算，也不会永久占住未使用的绑定。在途请求继续使用其原代际策略。
+
+计数只在当前进程内有效，重启清零，多副本不协调。TPM／TPD 按下文单独配置，持久化计数尚未实现，也不导入旧日志计数：这里统计逻辑准入，不统计日志完成。共享原语 `nyro_limit::request::RequestLimit` 接收 `(count, Duration)` 窗口，可与 `RateLimit` 原子组合；`nyro_llm::subject_limit::SubjectLimitRegistry` 负责主体作用域。不向 `nyro-limit` 引入 HTTP、LLM 或数据库类型，不增加内核职责。Rust 调用方构造 `config::Config` 时需提供 `subject_limits`，空映射保留原行为；逐字段构造 `SharedResources` 时也需提供该注册表，或使用 `..Default::default()`。
+
+回归：`cargo test -p nyro-limit` 和 `cargo test -p nyro-llm --test rate_runtime`；根代理重载冒烟覆盖轮换、拒绝变更、禁用／重新启用及移除后重新加入。
+
+## 主体 token 窗口
+
+同一份 `llm.subject_limits` 策略可以配置 TPM／TPD，也可以与 RPM／RPD 同时启用：
+
+```yaml
+llm:
+  subject_limits:
+    deploy:
+      tpm: 100000
+      tpd: 1000000
+      reserve_tokens: 4096
+```
+
+`tpm` 和 `tpd` 是可选的正 `u64`，限制归一化后的输入加输出 token。配置任一项时必须提供正 `reserve_tokens`，且不超过每个已配置的 token 窗口上限。没有 token 窗口却配置预留量、零、显式 `null`、错误类型和未知字段均拒绝。请求和 token 规则可以共存，但 `rpm`、`rpd`、`tpm`、`tpd` 至少启用一项。模型 `quota.reserve_tokens` 与主体 `reserve_tokens` 是独立设置，可以不同。Rust `SubjectLimitConfig` 字面量需提供新增的 `tpm`、`tpd`、`reserve_tokens` 字段，原请求窗口策略设为 `None`。
+
+Nyro 在逻辑请求频率准入和 backend 健康选择之后，为每次选定的上游尝试预留主体 token。所有主体 token 窗口与可选的模型累计 quota 原子预留；拒绝不改变两类 token 预算，不发起新的上游请求，并立即释放并发许可。此前已准入的 RPM／RPD／模型 rate 次数仍然保留。每次重试都需要新的 token 预留，但逻辑请求只计一次；没有可用健康 backend 时不预留 token。
+
+在途预留持续占用每个 token 窗口，直到结算或释放，长请求或 SSE 跨窗口时不会过期。上游协议完整终止并通过校验后，以实际用量替换预留，接受明确的零及超过预留的用量。每笔正结算从结算时刻进入滚动窗口，分别在 60 秒（TPM）或 24 小时（TPD）后准确过期，不在午夜重置。这一规则统计已结算尝试用量加全部在途预留，不假定知道上游每个 token 的生成时刻。跨过一分钟的流仍占用预留，结束时才开始已结算用量的窗口时长。
+
+明确的连接建立失败会释放两类预留。HTTP 错误、传输／协议失败、取消、超时、截断以及响应体／处理 future 丢弃，均按各预算自身预留与已知最高有效用量的较大值结算；完整响应缺少用量时也采用该回退。模型和主体分别使用自己的预留量，因此未知结果可能扣减不同数值；完整用量则分别结算为相同实际值，不将两者相加。流式累计快照替换旧值，不逐帧累加；无效／递减快照不能降低已有扣费。协议成功完成后结算已确定，后续下游交付失败不重复结算。
+
+预留量由运维配置，不是厂商真实消耗的可信上界。实际用量可超过窗口限制，Nyro 会记录欠额并阻止后续预留，直到足够的已结算用量过期；不会仅因观测用量超过预留就截断已准入流。未知结果可能被高估。因此窗口按报告用量或回退值控制准入，不承诺真实上游 token 生成的硬上限。
+
+主体 token 拒绝使用原生协议 `429`，OpenAI API 的错误码为 `rate_limit_exceeded`。如果已结算用量过期后能腾出空间，`Retry-After` 取各阻塞窗口所需等待的最大值并向上取整为秒，可能需要多笔结算记录过期；若仅在途预留就已阻塞新尝试，因为完成时间未知，不返回该 Header。重试时仍可能受新流量或后续结算影响。模型累计 quota 拒绝沿用 `quota_exceeded`，不返回等待时间；Anthropic 使用 `rate_limit_error`，Gemini 使用 `RESOURCE_EXHAUSTED`。
+
+主体作用域与生命周期沿用请求窗口规则：同一认证主体跨模型别名、已支持 API／工作负载及严格／原生路径共享状态。匿名请求没有主体 token 预算，认证用户访问匿名模型仍受主体策略限制。重载、轮换 secret、禁用／重新启用、到期／续期、移除／重新加入均保留在途预留及未过期结算。存在活跃绑定、在途凭据或未过期请求／token 历史时，修改该主体策略参数会拒绝候选，包括为活跃的仅请求窗口策略新增 token 规则；需要立即修改时重启。没有活跃绑定、请求与 token 历史均已清空且没有预留时，后续绑定可以回收旧策略。失败候选不能重置现役计数。
+
+`nyro_limit::window::WindowQuota` 按通用单位计量，不依赖 LLM、认证、HTTP、存储或内核类型。`SubjectLimitRegistry::token_snapshots` 按 TPM、TPD 顺序返回已配置窗口。请求／尝试日志通过 `token_window_charged_tokens` 单独记录主体扣费，与 `quota_charged_tokens` 和上游报告的 `total_tokens` 分开；尝试字段 `token_window_outcome` 区分 `actual`、`fallback`、`released`、`disabled`。同时启用 TPM 与 TPD 时，主体扣费只在日志计一次。计数仍为进程内状态，重启清零，不导入旧日志；持久化和多副本协调继续后续推进。
+
+回归：`cargo test -p nyro-limit`、`cargo test -p nyro-llm --test quota_runtime --test observation_runtime`，以及构建 `nyro` 后运行根代理重载冒烟。
 
 ## Token 额度
 
@@ -484,7 +616,7 @@ LLM 运行时以 `INFO` 级别输出结构化 `tracing` 事件：每次已发出
 - HTTP 服务运行期间，`GET /healthz` 返回 `200`。
 - 内核 Host 接受新的代际 lease 时，`GET /readyz` 返回 `200`；停止接受时返回 `503`。这个源码构建代理没有数据库或上游 backend 就绪检查。
 
-重试与被动健康检查需要按上述配置显式开启。尚未实现额度的持久化／跨进程共享存储、控制面、Admin API、WebUI、`nyro serve` 或 `nyro tool`。程序不会展开环境变量，不接受旧 Standalone YAML，不自动监听文件，也不会远程获取配置；Unix 支持显式 SIGHUP 重载，不支持重载的设置仍需重启。
+重试与被动健康检查需要按上述配置显式开启。文件模式不提供控制面或 Admin API；独立的[实验性 `nyro serve`](rust-serve_CN.md) 已增加本地 SQLite 配置管理与发布。额度的持久化／跨进程共享存储、WebUI 和 `nyro tool` 仍未实现。程序不会展开环境变量，不接受旧 Standalone YAML，不自动监听文件，也不会远程获取配置；Unix 支持显式 SIGHUP 重载，不支持重载的设置仍需重启。
 
 贡献者可以在不连接真实 Provider 的情况下验证根进程、健康检查、认证、Chat、Embedding、SSE、脱敏和正常退出：
 
@@ -492,6 +624,14 @@ LLM 运行时以 `INFO` 级别输出结构化 `tracing` 事件：每次已发出
 cargo build -p nyro
 python3 tests/proxy_smoke.py
 ```
+
+## 本地多轮工具会话回归
+
+运行 `cargo test -p nyro-llm --test responses_runtime multiturn`，验证[会话矩阵](../../crates/nyro-llm/tests/responses_runtime/multiturn.rs)。测试将客户端实际收到的 JSON 或重组后的 SSE 回填到下一轮请求，连续执行“并行调用两个工具 → 反序返回结果 → 再调用一个工具 → 最终回答”。覆盖全部四种 API 的严格文本转换、Anthropic／Responses 图片结果互转、Gemini 图片结果同协议保留，以及三种协议的专有推理与图片组合；四种 API 另有匹配原生模式回归。每条成功会话包含三次请求，并分别使用全 JSON、全 SSE 和两种交替模式。
+
+断言检查后续上游历史中的内容顺序、调用 ID／参数、结果图片与 Gemini 命名引用、签名／加密推理、模型别名、凭证隔离、每轮用量和并发许可释放。第二轮缺失／重复／未知结果在要求完整批次的 Anthropic／Gemini 目标前拒绝；图片或专有推理不能表达的目标不发送请求，修正历史或使用原协议后仍可继续。
+
+该矩阵使用本地 HTTP mock 和测试内客户端，不调用真实工具、SDK 或厂商，也不验证厂商签名真实性。它补充多轮组合回归，不代表完整客户端兼容认证；真实客户端版本、厂商会话及其余未支持语义继续单独验收。
 
 ## Rust 调用方的有序 IR 迁移
 

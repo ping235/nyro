@@ -1,6 +1,6 @@
 //! Passive backend health shared explicitly across runtime generations.
 
-use crate::config::{Backend, HealthConfig, OpenAiApi, Provider, ProviderKind};
+use crate::config::{Backend, HealthConfig, Provider};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, Weak},
@@ -13,18 +13,9 @@ pub struct HealthRegistry {
     entries: Mutex<HashMap<HealthKey, Weak<BackendHealth>>>,
 }
 
-// Do not derive Debug: a binding contains provider credentials.
 #[derive(Eq, PartialEq, Hash)]
 struct HealthKey {
-    model: String,
-    backend: String,
-    provider: String,
-    kind: ProviderKind,
-    api: OpenAiApi,
-    native_chat: bool,
-    base_url: String,
-    api_key: Option<String>,
-    upstream_model: String,
+    binding: crate::binding::BackendKey,
     policy: HealthConfig,
 }
 
@@ -36,19 +27,8 @@ impl HealthRegistry {
         provider: &Provider,
         policy: &HealthConfig,
     ) -> Arc<BackendHealth> {
-        // Match Driver's effective endpoint and default API selection.
-        let mut base = reqwest::Url::parse(&provider.base_url).expect("validated provider URL");
-        base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
         let key = HealthKey {
-            model: model.into(),
-            backend: backend.id.clone(),
-            provider: backend.provider.clone(),
-            kind: provider.kind,
-            api: provider.api.unwrap_or_default(),
-            native_chat: provider.native_chat,
-            base_url: base.into(),
-            api_key: provider.api_key.clone(),
-            upstream_model: backend.upstream_model.clone(),
+            binding: crate::binding::BackendKey::new(model, backend, provider),
             policy: policy.clone(),
         };
         let mut entries = self.entries.lock().unwrap();
@@ -176,6 +156,7 @@ mod tests {
                 priority: 0,
             },
             Provider {
+                transport: Default::default(),
                 native_chat: false,
                 kind: ProviderKind::Openai,
                 api: None,
@@ -312,7 +293,7 @@ mod tests {
         let reused = registry.backend("chat", &weighted, &equivalent, &policy);
         assert!(Arc::ptr_eq(&first, &reused));
         assert!(!reused.available_at(now));
-        for change in 0..10 {
+        for change in 0..12 {
             let mut backend = backend.clone();
             let mut provider = provider.clone();
             let mut policy = policy.clone();
@@ -328,6 +309,8 @@ mod tests {
                 7 => provider.api_key = Some("changed-secret".into()),
                 8 => policy.failure_threshold = 1,
                 9 => provider.native_chat = true,
+                10 => provider.transport.proxy_url = Some("http://proxy.test:8080".into()),
+                11 => provider.transport.http1_only = true,
                 _ => unreachable!(),
             }
             let changed = registry.backend(model, &backend, &provider, &policy);

@@ -58,7 +58,7 @@ class Upstream(BaseHTTPRequestHandler):
             self.wfile.write(first)
             self.wfile.flush()
             self.stream_started.set()
-            if not self.release_stream.wait(20):
+            if not self.release_stream.wait(40):
                 return
             self.wfile.write(last)
         else:
@@ -274,6 +274,228 @@ def main():
                 models(["public", "public-added"], "limited-secret")
                 assert chat("public-failover", "client-secret-new")[0] == 200
                 assert sum(payload["model"] == "temporary-error" for _, payload in Upstream.calls) == failures_before
+                # Lifecycle edits retain subject bindings and take effect for new
+                # admissions; an admitted SSE body survives expiry and disabling.
+                inactive = copy.deepcopy(updated)
+                inactive["security"]["api_keys"][1]["enabled"] = False
+                disabled_generation = reload_config(inactive, "applied")
+                calls_before = len(Upstream.calls)
+                assert request("/v1/models", key="limited-secret")[0] == 401
+                assert chat("public-added", "limited-secret")[0] == 401
+                assert chat("public", "limited-secret")[0] == 401  # No anonymous fallback.
+                assert len(Upstream.calls) == calls_before
+                assert reload_config(inactive, "unchanged") == disabled_generation
+                invalid_lifecycle = copy.deepcopy(inactive)
+                invalid_lifecycle["security"]["api_keys"][1]["enabled"] = "true"
+                reload_config(invalid_lifecycle, "rejected", "invalid_config")
+                assert chat("public-added", "limited-secret")[0] == 401
+
+                expiring = copy.deepcopy(updated)
+                expires_at = int(time.time()) + 10
+                expiring["security"]["api_keys"][1]["expires_at"] = expires_at
+                assert reload_config(expiring, "applied") > disabled_generation
+                models(["public", "public-added"], "limited-secret")
+                Upstream.stream_started.clear()
+                Upstream.release_stream.clear()
+                stream_connection, stream_response = connect("/v1/chat/completions", {
+                    "model": "public-added", "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": True}, "limited-secret")
+                assert stream_response.status == 200 and Upstream.stream_started.wait(2)
+                first_event = b""
+                while not first_event.endswith(b"\n\n"):
+                    line = stream_response.readline()
+                    assert line, "stream closed before expiry test"
+                    first_event += line
+                assert b"old-start" in first_event
+                # Expiration is a wall-clock admission check, not a reload timer.
+                expiry_deadline = time.monotonic() + 15
+                while time.time() < expires_at:
+                    assert time.monotonic() < expiry_deadline, "wall clock did not reach key expiry"
+                    time.sleep(0.02)
+                calls_before = len(Upstream.calls)
+                assert request("/v1/models", key="limited-secret")[0] == 401
+                assert chat("public-added", "limited-secret")[0] == 401
+                assert len(Upstream.calls) == calls_before
+                assert reload_config(expiring, "unchanged") is not None
+                assert reload_config(updated, "applied") is not None  # Remove expiry; same binding.
+                models(["public", "public-added"], "limited-secret")
+                assert chat("public-added", "limited-secret")[0] == 200
+                reload_config(inactive, "applied")
+                assert chat("public-added", "limited-secret")[0] == 401
+                Upstream.release_stream.set()
+                remaining = stream_response.read()
+                assert b"old-finish" in remaining and remaining.endswith(b"data: [DONE]\n\n")
+                stream_connection.close()
+                stream_connection = None
+                reload_config(updated, "applied")
+
+                # Subject windows cross model aliases and survive credential/lifecycle edits.
+                # A distinct identity keeps this budget independent from earlier smoke requests.
+                limited = copy.deepcopy(updated)
+                limited["security"]["api_keys"].append({"id": "windowed", "secret": "window-secret-old"})
+                limited["llm"]["subject_limits"] = {"windowed": {"rpm": 2, "rpd": 2}}
+                limited["llm"]["models"]["public-added"]["subjects"].append("windowed")
+                reload_config(limited, "applied")
+                assert chat("public", "window-secret-old")[0] == 200
+                rotated = copy.deepcopy(limited)
+                rotated["security"]["api_keys"][-1]["secret"] = "window-secret-new"
+                reload_config(rotated, "applied")
+                assert chat("public", "window-secret-old")[0] == 401
+                assert chat("public-added", "window-secret-new")[0] == 200
+
+                def window_denied():
+                    calls_before = len(Upstream.calls)
+                    for name in ["public", "public-added"]:
+                        connection, response = connect("/v1/chat/completions", {
+                            "model": name, "messages": [{"role": "user", "content": "Hello"}]},
+                            "window-secret-new")
+                        try:
+                            assert response.status == 429
+                            assert 86340 < int(response.getheader("Retry-After")) <= 86400
+                            assert json.loads(response.read())["error"]["code"] == "rate_limit_exceeded"
+                        finally:
+                            connection.close()
+                    assert len(Upstream.calls) == calls_before
+
+                window_denied()
+                assert chat("public", "client-secret-new")[0] == 200
+                assert chat("public", None)[0] == 200
+                window_generation = reload_config(rotated, "unchanged")
+                for field, value, reason in [("rpm", 3, "candidate_rejected"),
+                                             ("rpd", 0, "invalid_config")]:
+                    changed_window = copy.deepcopy(rotated)
+                    changed_window["llm"]["subject_limits"]["windowed"][field] = value
+                    reload_config(changed_window, "rejected", reason)
+                    window_denied()
+                assert reload_config(rotated, "unchanged") == window_generation
+                disabled_window = copy.deepcopy(rotated)
+                disabled_window["security"]["api_keys"][-1]["enabled"] = False
+                reload_config(disabled_window, "applied")
+                assert chat("public", "window-secret-new")[0] == 401
+                reload_config(rotated, "applied")
+                window_denied()
+                # Remove subject, grants and rule, then add them back: history stays retained.
+                reload_config(updated, "applied")
+                assert chat("public", "window-secret-new")[0] == 401
+                reload_config(rotated, "applied")
+                window_denied()
+
+                # A pending token reservation survives rotation and generation retirement;
+                # a completed stream replaces it with actual usage before later admissions.
+                token_config = copy.deepcopy(rotated)
+                token_config["security"]["api_keys"].append({"id": "tokened", "secret": "token-secret-old"})
+                token_config["llm"]["subject_limits"]["tokened"] = {
+                    "tpm": 10, "tpd": 10, "reserve_tokens": 6}
+                reload_config(token_config, "applied")
+                Upstream.stream_started.clear()
+                Upstream.release_stream.clear()
+                stream_connection, stream_response = connect("/v1/chat/completions", {
+                    "model": "public", "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": True}, "token-secret-old")
+                assert stream_response.status == 200 and Upstream.stream_started.wait(2)
+                first_event = b""
+                while not first_event.endswith(b"\n\n"):
+                    line = stream_response.readline()
+                    assert line, "token window stream closed before first event"
+                    first_event += line
+                token_rotated = copy.deepcopy(token_config)
+                token_rotated["security"]["api_keys"][-1]["secret"] = "token-secret-new"
+                token_generation = reload_config(token_rotated, "applied")
+                assert chat("public", "token-secret-old")[0] == 401
+
+                def token_denied(pending):
+                    calls_before = len(Upstream.calls)
+                    connection, response = connect("/v1/chat/completions", {
+                        "model": "public", "messages": [{"role": "user", "content": "Hello"}]},
+                        "token-secret-new")
+                    try:
+                        assert response.status == 429
+                        if pending:
+                            assert response.getheader("Retry-After") is None
+                        else:
+                            assert 86340 < int(response.getheader("Retry-After")) <= 86400
+                        assert json.loads(response.read())["error"]["code"] == "rate_limit_exceeded"
+                    finally:
+                        connection.close()
+                    assert len(Upstream.calls) == calls_before
+
+                token_denied(True)
+                for field, value in [("tpm", 20), ("tpd", 20), ("reserve_tokens", 7)]:
+                    changed_token = copy.deepcopy(token_rotated)
+                    changed_token["llm"]["subject_limits"]["tokened"][field] = value
+                    reload_config(changed_token, "rejected", "candidate_rejected")
+                    token_denied(True)
+                assert reload_config(token_rotated, "unchanged") == token_generation
+                disabled_token = copy.deepcopy(token_rotated)
+                disabled_token["security"]["api_keys"][-1]["enabled"] = False
+                reload_config(disabled_token, "applied")
+                assert chat("public", "token-secret-new")[0] == 401
+                reload_config(token_rotated, "applied")
+                token_denied(True)
+                reload_config(rotated, "applied")  # Remove subject while its stream is in flight.
+                reload_config(token_rotated, "applied")
+                token_denied(True)
+                Upstream.release_stream.set()
+                remaining = stream_response.read()
+                assert b"old-finish" in remaining and remaining.endswith(b"data: [DONE]\n\n")
+                stream_connection.close()
+                stream_connection = None
+                # Actual usage is 2, so refunding the 6-unit reservation admits two more calls.
+                assert chat("public", "token-secret-new")[0] == 200
+                assert chat("public", "token-secret-new")[0] == 200
+                token_denied(False)
+                reload_config(rotated, "applied")
+                reload_config(token_rotated, "applied")
+                token_denied(False)
+
+                # Routing history is shared by root generations, including an old live SSE.
+                routed = copy.deepcopy(token_rotated)
+                routed["llm"]["models"]["public-routing"] = {
+                    "backends": [
+                        {"id": "a", "provider": "mock", "upstream_model": "routing-a"},
+                        {"id": "b", "provider": "mock", "upstream_model": "routing-b", "priority": 1}],
+                    "workloads": ["chat"], "subjects": ["tester"]}
+                reload_config(routed, "applied")
+                Upstream.stream_started.clear()
+                Upstream.release_stream.clear()
+                stream_connection, stream_response = connect("/v1/chat/completions", {
+                    "model": "public-routing", "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": True}, "client-secret-new")
+                assert stream_response.status == 200 and Upstream.stream_started.wait(2)
+                assert Upstream.calls[-1][1]["model"] == "routing-a"
+                first_event = b""
+                while not first_event.endswith(b"\n\n"):
+                    line = stream_response.readline()
+                    assert line, "routing stream closed before reload"
+                    first_event += line
+
+                def routed_chat(expected):
+                    status, body = chat("public-routing", "client-secret-new")
+                    assert status == 200, body
+                    assert json.loads(body)["choices"][0]["message"]["content"] == expected, body
+
+                routed["llm"]["models"]["public-routing"]["strategy"] = "least_recent"
+                routed["llm"]["models"]["public-routing"]["backends"][1]["priority"] = 0
+                routing_generation = reload_config(routed, "applied")
+                routed_chat("routing-b")
+                routed["llm"]["models"]["public-routing"]["backends"].reverse()
+                assert reload_config(routed, "unchanged") == routing_generation
+                invalid_strategy = copy.deepcopy(routed)
+                invalid_strategy["llm"]["models"]["public-routing"]["strategy"] = "cooldown"
+                reload_config(invalid_strategy, "rejected", "invalid_config")
+                routed_chat("routing-a")
+                routed["llm"]["models"]["public-routing"]["backends"][0]["upstream_model"] = "routing-c"
+                reload_config(routed, "applied")
+                routed_chat("routing-c")  # Changed binding starts without recent history.
+                routed["llm"]["models"]["public-routing"]["strategy"] = "latency"
+                reload_config(routed, "applied")
+                assert chat("public-routing", "client-secret-new")[0] == 200
+                Upstream.release_stream.set()
+                remaining = stream_response.read()
+                assert b"old-finish" in remaining and remaining.endswith(b"data: [DONE]\n\n")
+                stream_connection.close()
+                stream_connection = None
+
                 # A special file must not leave a blocking open alive during shutdown.
                 config.unlink()
                 os.mkfifo(config)
@@ -299,7 +521,7 @@ def main():
                     assert 'usage_state="not_attempted"' in line and "quota_charged_tokens=0" in line, line
                 reload_logs = "\n".join(reload_events())
                 for secret in ["client-secret-old", "client-secret-new", "upstream-secret-old",
-                               "upstream-secret-new", "private-invalid-provider-marker",
+                               "upstream-secret-new", "window-secret-old", "window-secret-new", "token-secret-old", "token-secret-new", "private-invalid-provider-marker",
                                "private-malformed-marker", str(config)]:
                     assert secret not in reload_logs, f"reload log leaked {secret}"
                 assert "fingerprint" not in reload_logs
@@ -314,7 +536,8 @@ def main():
         upstream.shutdown()
         upstream.server_close()
     print("proxy reload smoke passed: SIGHUP, atomic replacement, deduplication, rejection, "
-          "auth/routes, model discovery, SSE retention, rate/quota/health reuse, redacted logs, FIFO rejection, SIGTERM")
+          "auth/routes, model discovery, key disable/expiry/renewal, SSE retention, "
+          "subject RPM/RPD and TPM/TPD retention, rate/quota/health reuse, routing strategies/history, redacted logs, FIFO rejection, SIGTERM")
 
 
 if __name__ == "__main__":
