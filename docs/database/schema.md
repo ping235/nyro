@@ -2,27 +2,34 @@
 
 The released legacy Server and desktop applications support **SQLite** (default), **PostgreSQL**, and **MySQL**, with the entity tables documented below. Their generated reference schemas remain [postgres.sql](../../deploy/schema/postgres.sql) and [mysql.sql](../../deploy/schema/mysql.sql).
 
-The experimental root [`nyro serve`](../standalone/rust-serve.md) uses a **separate, dedicated SQLite database** owned by `nyro-control`. It neither imports nor modifies the legacy tables. PostgreSQL and MySQL reference files describe the legacy backend only; they do not contain this SQLite-only control schema.
+The experimental root [`nyro serve`](../standalone/rust-serve.md) uses a **separate, dedicated SQLite or PostgreSQL database** owned by `nyro-control`. It neither imports nor modifies the legacy tables. The legacy PostgreSQL and MySQL reference files do not describe the experimental control database; its PostgreSQL DDL is generated separately as [control-postgres.sql](../../deploy/schema/control-postgres.sql).
 
-## Experimental control database: version 1
+## Resource control database: schema version 2
 
-Source of truth: [`nyro-control/src/storage.rs`](../../crates/nyro-control/src/storage.rs). `PRAGMA user_version = 1`; the only schema object is the following strict table:
+Source of truth: [`nyro-control/src/resource/database.rs`](../../crates/nyro-control/src/resource/database.rs). The database owns four business tables. SQLite uses strict tables, `TEXT` JSON and `PRAGMA user_version = 2`; PostgreSQL uses `JSONB` and a metadata-only `public.nyro_schema(version)` row containing `2`.
 
-```sql
-CREATE TABLE nyro_control_state (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    draft_revision INTEGER NOT NULL CHECK (draft_revision > 0),
-    draft_json TEXT NOT NULL CHECK (length(CAST(draft_json AS BLOB)) BETWEEN 1 AND 1048576),
-    published_revision INTEGER NOT NULL CHECK (published_revision > 0 AND published_revision <= draft_revision),
-    published_json TEXT NOT NULL CHECK (length(CAST(published_json AS BLOB)) BETWEEN 1 AND 1048576)
-) STRICT;
+Every resource has `uid TEXT PRIMARY KEY`, `id TEXT NOT NULL UNIQUE`, and `name TEXT NOT NULL`. UIDs are generated once; public IDs can be renamed. Remaining columns are all NOT NULL:
+
+| Table | Columns |
+|---|---|
+| `upstreams` | `kind TEXT`, `balance TEXT`, `targets JSON` |
+| `models` | `capability TEXT`, `upstream_uid TEXT REFERENCES upstreams(uid)`, `access JSON`, `execution JSON`, `limits JSON` |
+| `mcps` | `upstream_uid TEXT REFERENCES upstreams(uid)`, `allowed_tools JSON`, `access JSON`, `execution JSON`, `limits JSON` |
+| `consumers` | `credentials JSON`, `grants JSON`, `limits JSON` |
+
+Here JSON means SQLite TEXT / PostgreSQL JSONB. `grants` stores model and MCP UIDs internally; API/YAML use public IDs. Nested targets contain connection/auth settings. Credential JSON is plaintext, so protect files, database access and backups.
+
+A new database starts empty. Old experimental `nyro_control_state` databases and unrelated schemas are refused, never erased or automatically imported. There is no draft/publish table, persistent configuration revision, or counter table. Control saves validate a complete candidate, replace the bounded resource set in one transaction, then distribute a full in-memory snapshot. Renames preserve UIDs and atomically rewrite references.
+
+SQLite holds exclusive ownership with DELETE journaling, FULL synchronous writes and private Unix file permissions. PostgreSQL holds an advisory session lock and defaults to verified TLS. One control process owns the database. On an uncertain write outcome, restart and inspect durable state before retrying. Routing/usage histories remain node-local and do not persist.
+
+Generate reference SQL from source; do not edit the generated file:
+
+```sh
+cargo run -p nyro-tools -- dump-schema --backend control-postgres > deploy/schema/control-postgres.sql
 ```
 
-The store requires exactly one row, with `singleton = 1`. Both JSON columns contain complete validated `nyro_config::Config` snapshots, including plaintext credentials; neither is an encrypted secret store. Initialization sets both revisions to `1`. A save compares the expected draft revision and increments it; publication copies the current draft to the published columns without incrementing its revision. Matching draft and published revisions must have identical JSON. Each JSON value is limited to 1 MiB in UTF-8 bytes.
-
-The published snapshot is the durable restart target. Runtime activation occurs after the database commit; `active_revision` is process state, not another database column. Draft storage does not persist runtime quotas, rate windows, health, routing history or request observations.
-
-The connection uses SQLite exclusive locking, DELETE journaling and FULL synchronous writes. Only one process owns the file. Schema version, schema shape, row count, revision relationships and decoded configurations are checked; unrelated and legacy databases are refused. New Unix files use mode `0600`; operators must protect the database directory and backups as credentials. See the [serve guide](../standalone/rust-serve.md) for startup permissions, publication and recovery.
+The legacy PostgreSQL/MySQL schemas below remain independent.
 
 ## Legacy entity schema
 
