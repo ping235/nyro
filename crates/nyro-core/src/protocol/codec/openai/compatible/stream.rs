@@ -78,6 +78,21 @@ impl ResponseDecoder for OpenAIResponseParser {
 
 // ── Non-streaming response formatter ──
 
+/// Normalizes an IR stop reason onto OpenAI's `finish_reason` vocabulary.
+///
+/// Clients are strict here: an unexpected value aborts the turn (pi reports
+/// `Provider finish_reason: completed` when a raw Responses lifecycle status
+/// leaks through). Unknown reasons therefore degrade to `stop` instead of being
+/// forwarded verbatim.
+fn canonical_finish_reason(reason: &str) -> &'static str {
+    match reason {
+        "length" | "max_tokens" => "length",
+        "tool_calls" | "tool_use" | "function_call" => "tool_calls",
+        "content_filter" => "content_filter",
+        _ => "stop",
+    }
+}
+
 pub struct OpenAIResponseFormatter;
 
 impl ResponseEncoder for OpenAIResponseFormatter {
@@ -85,7 +100,7 @@ impl ResponseEncoder for OpenAIResponseFormatter {
         let finish_reason = if !resp.tool_calls.is_empty() {
             Some("tool_calls")
         } else {
-            resp.stop_reason.as_deref()
+            resp.stop_reason.as_deref().map(canonical_finish_reason)
         };
         let mut message = serde_json::json!({
             "role": "assistant",
@@ -448,9 +463,9 @@ impl StreamResponseEncoder for OpenAIStreamFormatter {
                 }
                 AiStreamDelta::Done { stop_reason } => {
                     let final_reason = if self.saw_tool_call {
-                        "tool_calls".to_string()
+                        "tool_calls"
                     } else {
-                        stop_reason.clone()
+                        canonical_finish_reason(&stop_reason)
                     };
                     let chunk = serde_json::json!({
                         "id": self.id,
