@@ -4,7 +4,9 @@ use nyro_core::protocol::codec::anthropic::messages::stream::AnthropicResponseFo
 use nyro_core::protocol::codec::google::gemini::encoder::GoogleEncoder;
 use nyro_core::protocol::codec::google::gemini::stream::GoogleStreamFormatter;
 use nyro_core::protocol::codec::openai::compatible::encoder::OpenAIEncoder;
-use nyro_core::protocol::codec::openai::compatible::stream::OpenAIStreamFormatter;
+use nyro_core::protocol::codec::openai::compatible::stream::{
+    OpenAIResponseFormatter, OpenAIStreamFormatter,
+};
 use nyro_core::protocol::codec::openai::responses::decoder::ResponsesDecoder;
 use nyro_core::protocol::codec::openai::responses::encoder::ResponsesEncoder;
 use nyro_core::protocol::codec::openai::responses::formatter::ResponsesResponseFormatter;
@@ -1825,7 +1827,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":7,\"ou
     assert_eq!(text_concat, "Hello");
     assert_eq!(usage_input, 7);
     assert_eq!(usage_output, 2);
-    assert_eq!(done_reason.as_deref(), Some("completed"));
+    assert_eq!(done_reason.as_deref(), Some("stop"));
 }
 
 #[test]
@@ -1889,7 +1891,9 @@ fn responses_response_parser_extracts_text_tool_calls_and_usage() {
     assert_eq!(resp.id, "resp_42");
     assert_eq!(resp.model, "gpt-5.4");
     assert_eq!(resp.content, "Hi there");
-    assert_eq!(resp.stop_reason.as_deref(), Some("completed"));
+    // Canonical IR vocabulary only: a completed response carrying a
+    // function_call is `tool_calls`, never the raw Responses status.
+    assert_eq!(resp.stop_reason.as_deref(), Some("tool_calls"));
     assert_eq!(resp.usage.prompt_tokens, 11);
     assert_eq!(resp.usage.completion_tokens, 3);
     assert_eq!(resp.tool_calls.len(), 1);
@@ -2445,5 +2449,42 @@ fn responses_decoder_tolerates_empty_name_function_call_item() {
     assert!(
         orphan_tool_msgs.is_empty(),
         "all tool results should be correlated after normalize"
+    );
+}
+
+#[test]
+fn responses_completed_status_never_leaks_completed_as_chat_finish_reason() {
+    // End-to-end of the reported agent bug: a Responses upstream answers with
+    // status="completed", and the chat/completions client must see
+    // finish_reason="stop". Forwarding the raw status makes strict agents abort
+    // with `Error: Provider finish_reason: completed`.
+    let body = serde_json::json!({
+        "id": "resp_hi",
+        "model": "gpt-5.4",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Hi! What can I help you with?"}]
+        }],
+        "usage": {"input_tokens": 3, "output_tokens": 9}
+    });
+
+    let ir = ResponsesResponseParser
+        .parse_response(body)
+        .expect("responses parse");
+    let wire = OpenAIResponseFormatter.format_response(&ir);
+
+    assert_eq!(
+        wire["choices"][0]["finish_reason"],
+        serde_json::json!("stop"),
+        "chat finish_reason must be canonical, got {}",
+        wire["choices"][0]["finish_reason"]
+    );
+    assert_eq!(
+        wire["choices"][0]["message"]["content"],
+        serde_json::json!("Hi! What can I help you with?")
     );
 }

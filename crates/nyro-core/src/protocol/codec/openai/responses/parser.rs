@@ -22,11 +22,6 @@ impl ResponseDecoder for ResponsesResponseParser {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let stop_reason = resp
-            .get("status")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-
         let mut content = String::new();
         let mut tool_calls = Vec::new();
 
@@ -90,12 +85,59 @@ impl ResponseDecoder for ResponsesResponseParser {
             ..Usage::default()
         };
 
+        let stop_reason = responses_stop_reason(&resp, !tool_calls.is_empty());
+
         let mut ai_resp = AiResponse::new(id, model);
         ai_resp.content = content;
         ai_resp.tool_calls = tool_calls;
-        ai_resp.stop_reason = stop_reason;
+        ai_resp.stop_reason = Some(stop_reason);
         ai_resp.usage = usage;
         Ok(ai_resp)
+    }
+}
+
+/// Maps the Responses API lifecycle status onto the canonical IR stop reason
+/// vocabulary (`stop` / `tool_calls` / `length` / `content_filter`).
+///
+/// The raw status must never reach the IR: downstream encoders and clients only
+/// understand the canonical set, and leaking `"completed"` as a finish reason
+/// makes strict clients reject the turn outright (e.g. pi aborts the session
+/// with `Provider finish_reason: completed`). A completed response carrying a
+/// function_call becomes `tool_calls` so clients run the tool instead of
+/// ending the turn.
+fn responses_stop_reason(response: &Value, has_tool: bool) -> String {
+    match response
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("completed")
+    {
+        "completed" | "in_progress" | "queued" => {
+            if has_tool {
+                "tool_calls".to_string()
+            } else {
+                "stop".to_string()
+            }
+        }
+        "incomplete" => {
+            match response
+                .get("incomplete_details")
+                .and_then(|d| d.get("reason"))
+                .and_then(|v| v.as_str())
+            {
+                Some("content_filter") => "content_filter".to_string(),
+                // Responses "incomplete" is almost always max_output_tokens.
+                _ => "length".to_string(),
+            }
+        }
+        // failed / cancelled and any unknown status: keep the client-visible
+        // vocabulary valid instead of forwarding an unrecognized reason.
+        _ => {
+            if has_tool {
+                "tool_calls".to_string()
+            } else {
+                "stop".to_string()
+            }
+        }
     }
 }
 
@@ -263,7 +305,7 @@ impl ResponsesStreamParser {
                     }
                 }
             }
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
                 let response = payload.get("response").unwrap_or(payload);
                 let usage = Usage {
                     prompt_tokens: response
@@ -282,11 +324,10 @@ impl ResponsesStreamParser {
                     deltas.push(AiStreamDelta::Usage(usage));
                 }
                 deltas.push(AiStreamDelta::Done {
-                    stop_reason: response
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("completed")
-                        .to_string(),
+                    stop_reason: responses_stop_reason(
+                        response,
+                        !self.started_tool_call_indexes.is_empty(),
+                    ),
                 });
             }
             _ => {}
@@ -329,8 +370,82 @@ mod tests {
         });
         let r = ResponsesResponseParser.parse_response(resp).unwrap();
         assert_eq!(r.content, "hello");
-        assert_eq!(r.stop_reason.as_deref(), Some("completed"));
+        assert_eq!(r.stop_reason.as_deref(), Some("stop"));
         assert_eq!(r.usage.prompt_tokens, 5);
+    }
+
+    #[test]
+    fn test_parse_response_status_maps_to_canonical_stop_reason() {
+        // Regression: the Responses lifecycle status must not leak into the IR
+        // stop reason. Leaking "completed" reaches clients as a non-standard
+        // finish_reason, which strict agents reject outright
+        // ("Provider finish_reason: completed"). Text → stop,
+        // function_call → tool_calls, truncated → length.
+        let text = serde_json::json!({
+            "id": "resp_t",
+            "model": "m",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }]
+        });
+        let r = ResponsesResponseParser.parse_response(text).unwrap();
+        assert_eq!(r.stop_reason.as_deref(), Some("stop"));
+
+        let tool = serde_json::json!({
+            "id": "resp_f",
+            "model": "m",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "f",
+                "arguments": "{}",
+                "status": "completed"
+            }]
+        });
+        let r = ResponsesResponseParser.parse_response(tool).unwrap();
+        assert_eq!(r.stop_reason.as_deref(), Some("tool_calls"));
+
+        let truncated = serde_json::json!({
+            "id": "resp_i",
+            "model": "m",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": []
+        });
+        let r = ResponsesResponseParser.parse_response(truncated).unwrap();
+        assert_eq!(r.stop_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn test_stream_completed_event_maps_to_canonical_stop_reason() {
+        let sse = [
+            sse_event(
+                "response.created",
+                r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-4o","status":"in_progress"}}"#,
+            ),
+            sse_event(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"id":"resp_1","model":"gpt-4o","status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":3}}}"#,
+            ),
+        ]
+        .concat();
+
+        let mut parser = ResponsesStreamParser::new();
+        let deltas = parser.parse_chunk(&sse).unwrap();
+
+        assert!(
+            deltas.iter().any(
+                |d| matches!(d, AiStreamDelta::Done { stop_reason } if stop_reason == "stop")
+            ),
+            "expected Done{{stop_reason: stop}}, got: {deltas:?}"
+        );
     }
 
     #[test]
