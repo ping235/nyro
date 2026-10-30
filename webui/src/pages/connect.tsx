@@ -1,6 +1,7 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Code2, Copy, TerminalSquare } from "lucide-react";
+import { useSearchParams } from "react-router-dom";
+import { Check, Code2, Copy, FlaskConical, TerminalSquare } from "lucide-react";
 
 import { backend, IS_TAURI } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
@@ -12,6 +13,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { ModelTestPanel } from "@/components/model-test-panel";
 
 const CodeHighlighter = lazy(() => import("@/components/ui/code-highlighter"));
 
@@ -392,8 +394,12 @@ export default function ConnectPage() {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
   const qc = useQueryClient();
+  const [searchParams] = useSearchParams();
 
-  const [tab, setTab] = useState<"code" | "cli">("cli");
+  const [tab, setTab] = useState<"code" | "cli" | "test">(() => {
+    const initial = searchParams.get("tab");
+    return initial === "code" || initial === "test" ? initial : "cli";
+  });
   const [codeLang, setCodeLang] = useState<CodeLanguage>("python");
   const [selectedCodeProtocol, setSelectedCodeProtocol] = useState<CodeProtocol>("openai-compatible");
   const [selectedCodeRouteId, setSelectedCodeRouteId] = useState("");
@@ -743,8 +749,8 @@ export default function ConnectPage() {
       </div>
 
       <div className="connect-panel glass rounded-2xl p-5">
-        <Tabs value={tab} onValueChange={(next) => setTab(next as "code" | "cli")} className="space-y-3">
-          <TabsList className="connect-switch-tabs-list grid h-12 w-full grid-cols-2 rounded-xl p-1 md:w-1/2">
+        <Tabs value={tab} onValueChange={(next) => setTab(next as "code" | "cli" | "test")} className="space-y-3">
+          <TabsList className="connect-switch-tabs-list grid h-12 w-full grid-cols-3 rounded-xl p-1 md:w-2/3">
             <TabsTrigger
               className="connect-switch-tab-trigger h-10 gap-1.5 text-sm font-medium"
               value="cli"
@@ -758,6 +764,13 @@ export default function ConnectPage() {
             >
               <Code2 className="h-4 w-4" />
               {isZh ? "代码接入" : "Code"}
+            </TabsTrigger>
+            <TabsTrigger
+              className="connect-switch-tab-trigger h-10 gap-1.5 text-sm font-medium"
+              value="test"
+            >
+              <FlaskConical className="h-4 w-4" />
+              {isZh ? "模型测试" : "Model Test"}
             </TabsTrigger>
           </TabsList>
 
@@ -1146,6 +1159,10 @@ export default function ConnectPage() {
                 </p>
               )}
             </div>
+          </TabsContent>
+
+          <TabsContent value="test" className="!mt-1">
+            <ModelTestPanel models={routes} apiKeys={apiKeys} />
           </TabsContent>
 
         </Tabs>

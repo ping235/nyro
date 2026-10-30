@@ -1,4 +1,4 @@
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
@@ -118,6 +118,10 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         .route("/api-keys/:id", api_keys_item)
         .route("/logs", get(query_logs_handler).delete(clear_logs_handler))
         .route("/logs/:id", get(get_log_handler))
+        .route(
+            "/playground/chat",
+            post(playground_chat_handler).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/stats/overview", get(stats_overview))
         .route("/stats/hourly", get(stats_hourly))
         .route("/stats/models", get(stats_by_model))
@@ -497,6 +501,116 @@ async fn delete_api_key_handler(
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => err(e),
     }
+}
+
+// ── Playground ──
+
+#[derive(Deserialize)]
+struct PlaygroundChatRequest {
+    #[serde(default)]
+    api_key: Option<String>,
+    /// Ingress path to exercise; defaults to Chat Completions for older clients.
+    #[serde(default)]
+    path: Option<String>,
+    payload: serde_json::Value,
+}
+
+/// Ingress endpoints the console playground may drive. Anything else is
+/// rejected so the admin bridge can never be used as an open proxy.
+const PLAYGROUND_PATHS: [&str; 4] = [
+    "/v1/chat/completions",
+    "/v1/responses",
+    "/v1/messages",
+    "/v1beta/models/",
+];
+
+/// Validates the requested playground path, falling back to Chat Completions.
+fn playground_path(raw: Option<&str>) -> Result<String, String> {
+    let path = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("/v1/chat/completions");
+    let suspicious = path
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch == '\\')
+        || path.contains("://")
+        || path.contains("..");
+    if suspicious || !path.starts_with('/') {
+        return Err(format!("unsupported playground path: {path}"));
+    }
+    if !PLAYGROUND_PATHS
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    {
+        return Err(format!("unsupported playground path: {path}"));
+    }
+    Ok(path.to_string())
+}
+
+/// Server-side bridge to the proxy so the console can exercise a model without
+/// dealing with proxy CORS rules. The response body (JSON or SSE) is forwarded
+/// verbatim, and the request still shows up in the gateway request logs.
+async fn playground_chat_handler(
+    State(gw): State<Gateway>,
+    Json(req): Json<PlaygroundChatRequest>,
+) -> axum::response::Response {
+    let host = match gw.config.proxy_host.trim() {
+        "0.0.0.0" | "::" | "[::]" | "" => "127.0.0.1",
+        other => other,
+    };
+    let path = match playground_path(req.path.as_deref()) {
+        Ok(path) => path,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response();
+        }
+    };
+    let url = format!("http://{host}:{}{path}", gw.config.proxy_port);
+
+    let mut builder = gw.http_client.post(&url).json(&req.payload);
+    if let Some(key) = req
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        builder = builder.bearer_auth(key);
+    }
+
+    let upstream = match builder.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("gateway proxy is unreachable: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = upstream
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .cloned();
+
+    let mut response = axum::body::Body::from_stream(upstream.bytes_stream()).into_response();
+    *response.status_mut() = status;
+    if let Some(value) = content_type {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
 }
 
 // ── Logs ──
