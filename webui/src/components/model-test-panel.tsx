@@ -20,6 +20,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { formatDuration, formatTokenCount, formatTps } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
+import { filterModelsByApiKey } from "@/lib/model-access";
 import {
   API_TYPES,
   DEFAULT_PARAMS,
@@ -195,6 +196,13 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
     () => models.find((item) => item.name === configDraft.modelName) ?? null,
     [models, configDraft.modelName],
   );
+  const draftKey = useMemo(
+    () => apiKeys.find((item) => item.id === configDraft.apiKeyId) ?? null,
+    [apiKeys, configDraft.apiKeyId],
+  );
+  // 模型下拉按所选 API Key 过滤，复用后端 /v1/models 的可见性规则。
+  const draftModels = useMemo(() => filterModelsByApiKey(models, draftKey), [models, draftKey]);
+  const draftModelsEmpty = models.length > 0 && draftModels.length === 0;
 
   const openConfig = useCallback(() => {
     setConfigDraft({ apiType, modelName, apiKeyId, params });
@@ -225,6 +233,16 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
     const fallback = keyOptions.find((item) => item.id !== "");
     if (fallback) setApiKeyId(fallback.id);
   }, [selectedModel, keyOptions, apiKeyId]);
+
+  // 切换 API Key 后，若草稿中的模型在该 Key 下不可见，回落到首个可用模型。
+  useEffect(() => {
+    if (!configOpen) return;
+    if (draftModels.some((item) => item.name === configDraft.modelName)) return;
+    const fallback = draftModels.find((item) => item.is_enabled) ?? draftModels[0];
+    const nextName = fallback?.name ?? "";
+    if (nextName === configDraft.modelName) return;
+    setConfigDraft((prev) => ({ ...prev, modelName: nextName }));
+  }, [configOpen, draftModels, configDraft.modelName]);
 
   const streaming = history.some((message) => message.pending);
   const streamingRef = useRef(streaming);
@@ -551,16 +569,28 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
               </p>
               <Combobox
                 className="bg-white"
-                value={draftModel?.name ?? ""}
+                value={
+                  draftModels.some((item) => item.name === configDraft.modelName)
+                    ? configDraft.modelName
+                    : ""
+                }
                 onValueChange={(value) =>
                   setConfigDraft((prev) => ({ ...prev, modelName: value }))
                 }
-                options={models.map((option) => ({ value: option.name, label: option.name }))}
+                options={draftModels.map((option) => ({ value: option.name, label: option.name }))}
                 placeholder={
                   hasModels
-                    ? isZh
-                      ? "选择模型"
-                      : "Select model"
+                    ? draftModels.length > 0
+                      ? isZh
+                        ? "选择模型"
+                        : "Select model"
+                      : configDraft.apiKeyId
+                        ? isZh
+                          ? "该 Key 下暂无可用模型"
+                          : "No model available for this key"
+                        : isZh
+                          ? "请先选择 API Key"
+                          : "Select an API key first"
                     : isZh
                       ? "请先创建模型"
                       : "Create a model first"
@@ -571,6 +601,12 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
               {!hasModels ? (
                 <p className="ml-1 text-xs text-amber-600">
                   {isZh ? "还没有创建任何模型路由" : "No model routes yet"}
+                </p>
+              ) : draftModelsEmpty ? (
+                <p className="ml-1 text-xs text-amber-600">
+                  {isZh
+                    ? "当前 API Key 未绑定可用模型，请更换 Key 或到「API Key」页绑定模型"
+                    : "No model bound to this key. Pick another key or bind models on the API Keys page"}
                 </p>
               ) : draftModel?.enable_auth ? (
                 <p className="model-test-muted ml-1 text-xs">

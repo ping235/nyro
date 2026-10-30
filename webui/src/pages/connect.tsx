@@ -7,6 +7,7 @@ import { backend, IS_TAURI } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import type { ApiKey, GatewayStatus, ModelCapabilities, Model as ModelType } from "@/lib/types";
 import { useLocale } from "@/lib/i18n";
+import { filterApiKeysByModel } from "@/lib/model-access";
 import { Button } from "@/components/ui/button";
 import { Combobox } from "@/components/ui/combobox";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -508,10 +509,10 @@ export default function ConnectPage() {
     [codeRoutes, selectedCodeRouteId],
   );
 
-  const codeAvailableKeys = useMemo(() => {
-    if (!selectedRoute) return [];
-    return apiKeys.filter((key) => key.model_ids.includes(selectedRoute.id));
-  }, [apiKeys, selectedRoute]);
+  const codeAvailableKeys = useMemo(
+    () => filterApiKeysByModel(apiKeys, selectedRoute),
+    [apiKeys, selectedRoute],
+  );
 
   useEffect(() => {
     if (!selectedRoute?.enable_auth) {
@@ -544,10 +545,10 @@ export default function ConnectPage() {
     () => cliRoutes.find((route) => route.id === selectedCliRouteId) ?? null,
     [cliRoutes, selectedCliRouteId],
   );
-  const cliAvailableKeys = useMemo(() => {
-    if (!selectedCliRoute) return [];
-    return apiKeys.filter((key) => key.model_ids.includes(selectedCliRoute.id));
-  }, [apiKeys, selectedCliRoute]);
+  const cliAvailableKeys = useMemo(
+    () => filterApiKeysByModel(apiKeys, selectedCliRoute),
+    [apiKeys, selectedCliRoute],
+  );
 
   useEffect(() => {
     if (tab !== "cli") return;
