@@ -67,6 +67,24 @@ type ConfigDraft = {
 
 const EMPTY_HISTORY: ChatMessage[] = [];
 
+/**
+ * Module-level snapshot so the conversation, draft input and request config survive
+ * route/tab switches (component unmount) within the SPA session. Cleared by 「清空」;
+ * a full page reload drops it, matching its "temporary" intent.
+ */
+type PanelSnapshot = {
+  apiType: ApiTypeId;
+  modelName: string;
+  apiKeyId: string;
+  params: ChatParams;
+  history: ChatMessage[];
+  draft: string;
+  attachments: TestAttachment[];
+  requestCount: number;
+};
+
+let panelSnapshot: PanelSnapshot | null = null;
+
 function readAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -144,16 +162,31 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
   const isZh = locale === "zh-CN";
   const navigate = useNavigate();
 
-  const [apiType, setApiType] = useState<ApiTypeId>("chat-completions");
-  const [modelName, setModelName] = useState("");
-  const [apiKeyId, setApiKeyId] = useState("");
-  const [params, setParams] = useState<ChatParams>(DEFAULT_PARAMS);
-  const [history, setHistory] = useState<ChatMessage[]>(EMPTY_HISTORY);
-  const [draft, setDraft] = useState("");
-  const [attachments, setAttachments] = useState<TestAttachment[]>([]);
+  const [apiType, setApiType] = useState<ApiTypeId>(() => panelSnapshot?.apiType ?? "chat-completions");
+  const [modelName, setModelName] = useState(() => panelSnapshot?.modelName ?? "");
+  const [apiKeyId, setApiKeyId] = useState(() => panelSnapshot?.apiKeyId ?? "");
+  const [params, setParams] = useState<ChatParams>(() => panelSnapshot?.params ?? DEFAULT_PARAMS);
+  const [history, setHistory] = useState<ChatMessage[]>(() => {
+    const list = panelSnapshot?.history;
+    if (!list || list.length === 0) return EMPTY_HISTORY;
+    // A stream aborted at unmount leaves the last message pending; settle it on restore.
+    return list.map((message) =>
+      message.pending
+        ? {
+            ...message,
+            pending: false,
+            text: message.text || (isZh ? "已停止生成" : "Generation stopped"),
+          }
+        : message,
+    );
+  });
+  const [draft, setDraft] = useState(() => panelSnapshot?.draft ?? "");
+  const [attachments, setAttachments] = useState<TestAttachment[]>(
+    () => panelSnapshot?.attachments ?? [],
+  );
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [requestCount, setRequestCount] = useState(0);
+  const [requestCount, setRequestCount] = useState(() => panelSnapshot?.requestCount ?? 0);
   const [expandedErrorId, setExpandedErrorId] = useState<string | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
   const [configDraft, setConfigDraft] = useState<ConfigDraft>({
@@ -223,6 +256,7 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
   }, [configDraft]);
 
   useEffect(() => {
+    if (models.length === 0) return; // keep the restored name until the catalog is available
     if (modelName && models.some((item) => item.name === modelName)) return;
     const fallback = enabledModels[0] ?? models[0];
     setModelName(fallback?.name ?? "");
@@ -275,6 +309,11 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
   }, [history]);
 
   useEffect(() => () => abortRef.current?.abort(), []);
+
+  // Keep the module snapshot in sync so the panel can be restored after unmount.
+  useEffect(() => {
+    panelSnapshot = { apiType, modelName, apiKeyId, params, history, draft, attachments, requestCount };
+  }, [apiType, modelName, apiKeyId, params, history, draft, attachments, requestCount]);
 
   const updateDraftParams = useCallback((patch: Partial<ChatParams>) => {
     setConfigDraft((prev) => ({ ...prev, params: { ...prev.params, ...patch } }));
@@ -498,7 +537,10 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
 
   const clearConversation = useCallback(() => {
     abortRef.current?.abort();
+    panelSnapshot = null;
     setHistory([]);
+    setDraft("");
+    setAttachments([]);
     setRequestCount(0);
     setNotice(null);
     setExpandedErrorId(null);
@@ -706,34 +748,6 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
       ) : null}
 
       <section className="glass order-1 flex h-[min(720px,calc(100vh-260px))] min-h-[520px] flex-col overflow-hidden rounded-2xl">
-        <header className="model-test-divider flex items-start justify-between gap-3 border-b px-4 py-3">
-          <div>
-            <div className="text-sm font-semibold">
-              {isZh ? "对话调试" : "Conversation"}
-            </div>
-            <p className="model-test-muted mt-0.5 text-xs">
-              {isZh
-                ? "请求经网关代理转发，自动进入请求日志"
-                : "Requests go through the gateway proxy and are logged"}
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <Badge variant="secondary">
-              {`${isZh ? "请求" : "Requests"}: ${requestCount}`}
-            </Badge>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={clearConversation}
-              disabled={history.length === 0}
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-              {isZh ? "清空" : "Clear"}
-            </Button>
-          </div>
-        </header>
-
         <div ref={messagesRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
           {history.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center text-center">
@@ -983,6 +997,29 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
                 >
                   <Settings className="h-4 w-4" />
                 </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 shrink-0"
+                  onClick={clearConversation}
+                  disabled={history.length === 0}
+                  title={isZh ? "清空对话" : "Clear conversation"}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  {isZh ? "清空" : "Clear"}
+                </Button>
+                <Badge
+                  variant="secondary"
+                  className="ml-1.5 shrink-0"
+                  title={
+                    isZh
+                      ? "请求经网关代理转发，自动进入请求日志"
+                      : "Requests go through the gateway proxy and are logged"
+                  }
+                >
+                  {`${isZh ? "请求" : "Requests"}: ${requestCount}`}
+                </Badge>
               </div>
               {sending ? (
                 <Button
