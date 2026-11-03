@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { ChevronLeft, ChevronRight, ScrollText, Trash2 } from "lucide-react";
 
 import { backend } from "@/lib/backend";
@@ -30,9 +31,27 @@ export default function LogsPage() {
   const qc = useQueryClient();
 
   const [page, setPage] = useState(0);
-  const [filter, setFilter] = useState<LogQuery>({ limit: PAGE_SIZE, offset: 0 });
+  const [searchParams, setSearchParams] = useSearchParams();
+  const urlModel = searchParams.get("model") ?? "";
+  const [filter, setFilter] = useState<LogQuery>(() => ({
+    limit: PAGE_SIZE,
+    offset: 0,
+    ...(urlModel ? { model: urlModel } : {}),
+  }));
   const [selected, setSelected] = useState<RequestLog | null>(null);
+  // `?log=<id>` deep link (e.g. from the model test tab) opens the detail directly.
+  const [directLogId, setDirectLogId] = useState<string | null>(() => searchParams.get("log"));
   const [confirmOpen, setConfirmOpen] = useState(false);
+
+  const closeDetail = () => {
+    setSelected(null);
+    setDirectLogId(null);
+    if (searchParams.get("log")) {
+      const next = new URLSearchParams(searchParams);
+      next.delete("log");
+      setSearchParams(next, { replace: true });
+    }
+  };
 
   const clearMut = useMutation({
     mutationFn: () => backend("clear_logs"),
@@ -377,11 +396,11 @@ export default function LogsPage() {
       )}
 
       <LogDetailDialog
-        logId={selected?.id ?? null}
+        logId={directLogId ?? selected?.id ?? null}
         summary={selected}
-        open={!!selected}
+        open={Boolean(directLogId || selected)}
         onOpenChange={(open) => {
-          if (!open) setSelected(null);
+          if (!open) closeDetail();
         }}
       />
 
