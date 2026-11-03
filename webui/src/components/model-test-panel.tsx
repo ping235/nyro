@@ -607,6 +607,23 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
 
             <div className="space-y-2">
               <p className="ml-1 text-xs leading-none font-normal text-slate-900">
+                {isZh ? "API Key" : "API key"}
+              </p>
+              <Combobox
+                className="bg-white"
+                value={configDraft.apiKeyId}
+                onValueChange={(value) =>
+                  setConfigDraft((prev) => ({ ...prev, apiKeyId: value }))
+                }
+                options={keyOptions.map((option) => ({ value: option.id, label: option.name }))}
+                placeholder={isZh ? "选择 API Key" : "Select API key"}
+                searchPlaceholder={isZh ? "搜索 API Key..." : "Search API keys..."}
+                emptyText={isZh ? "暂无可选 API Key" : "No API keys available"}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <p className="ml-1 text-xs leading-none font-normal text-slate-900">
                 {isZh ? "模型" : "Model"}
               </p>
               <Combobox
@@ -655,23 +672,6 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
                   {isZh ? "该模型开启了鉴权，需选择 API Key" : "Auth enabled, an API key is required"}
                 </p>
               ) : null}
-            </div>
-
-            <div className="space-y-2">
-              <p className="ml-1 text-xs leading-none font-normal text-slate-900">
-                {isZh ? "API Key" : "API key"}
-              </p>
-              <Combobox
-                className="bg-white"
-                value={configDraft.apiKeyId}
-                onValueChange={(value) =>
-                  setConfigDraft((prev) => ({ ...prev, apiKeyId: value }))
-                }
-                options={keyOptions.map((option) => ({ value: option.id, label: option.name }))}
-                placeholder={isZh ? "选择 API Key" : "Select API key"}
-                searchPlaceholder={isZh ? "搜索 API Key..." : "Search API keys..."}
-                emptyText={isZh ? "暂无可选 API Key" : "No API keys available"}
-              />
             </div>
 
             <div className="model-test-muted pt-1 text-xs font-medium uppercase tracking-wide">
