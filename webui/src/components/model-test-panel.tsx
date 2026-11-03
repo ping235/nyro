@@ -43,6 +43,12 @@ import type {
   StreamDelta,
   TestAttachment,
 } from "@/lib/model-test";
+import {
+  clearModelTestSnapshot,
+  loadModelTestSnapshot,
+  saveModelTestSnapshot,
+} from "@/lib/model-test-session";
+import type { ModelTestSnapshot } from "@/lib/model-test-session";
 import type { ApiKey, Model as ModelType } from "@/lib/types";
 
 type ModelTestPanelProps = {
@@ -67,23 +73,15 @@ type ConfigDraft = {
 
 const EMPTY_HISTORY: ChatMessage[] = [];
 
-/**
- * Module-level snapshot so the conversation, draft input and request config survive
- * route/tab switches (component unmount) within the SPA session. Cleared by 「清空」;
- * a full page reload drops it, matching its "temporary" intent.
- */
-type PanelSnapshot = {
-  apiType: ApiTypeId;
-  modelName: string;
-  apiKeyId: string;
-  params: ChatParams;
-  history: ChatMessage[];
-  draft: string;
-  attachments: TestAttachment[];
-  requestCount: number;
-};
+/** Coalesces localStorage writes while a response streams in. */
+const SESSION_PERSIST_INTERVAL_MS = 600;
 
-let panelSnapshot: PanelSnapshot | null = null;
+/**
+ * Module-level cache of the persisted session, so route/tab switches (component unmount)
+ * restore instantly without a storage read. It is backed by localStorage, which keeps
+ * the conversation across full page reloads until the user presses 「清空」.
+ */
+let panelSnapshot: ModelTestSnapshot | null = loadModelTestSnapshot();
 
 function readAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -197,6 +195,7 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
   });
 
   const abortRef = useRef<AbortController | null>(null);
+  const persistTimerRef = useRef<number | null>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -310,10 +309,34 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
-  // Keep the module snapshot in sync so the panel can be restored after unmount.
+  // Keep the module cache in sync and persist it. Writes are coalesced because streaming
+  // replaces the history on every delta, so one write per interval is plenty.
   useEffect(() => {
     panelSnapshot = { apiType, modelName, apiKeyId, params, history, draft, attachments, requestCount };
+    if (persistTimerRef.current !== null) return;
+    persistTimerRef.current = window.setTimeout(() => {
+      persistTimerRef.current = null;
+      if (panelSnapshot) saveModelTestSnapshot(panelSnapshot);
+    }, SESSION_PERSIST_INTERVAL_MS);
   }, [apiType, modelName, apiKeyId, params, history, draft, attachments, requestCount]);
+
+  // Flush the pending write when the page is hidden or reloaded, and on unmount.
+  useEffect(() => {
+    const flush = () => {
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+      if (panelSnapshot) saveModelTestSnapshot(panelSnapshot);
+    };
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", flush);
+      flush();
+    };
+  }, []);
 
   const updateDraftParams = useCallback((patch: Partial<ChatParams>) => {
     setConfigDraft((prev) => ({ ...prev, params: { ...prev.params, ...patch } }));
@@ -538,6 +561,11 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
   const clearConversation = useCallback(() => {
     abortRef.current?.abort();
     panelSnapshot = null;
+    if (persistTimerRef.current !== null) {
+      window.clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
+    clearModelTestSnapshot();
     setHistory([]);
     setDraft("");
     setAttachments([]);
@@ -779,14 +807,31 @@ export function ModelTestPanel({ models, apiKeys }: ModelTestPanelProps) {
                 >
                   {message.attachments.length > 0 ? (
                     <div className="mb-2 flex flex-wrap gap-1.5">
-                      {message.attachments.map((attachment) => (
-                        <img
-                          key={attachment.id}
-                          src={attachment.dataUrl}
-                          alt={attachment.name}
-                          className="model-test-thumb h-16 w-16 rounded-lg object-cover"
-                        />
-                      ))}
+                      {message.attachments.map((attachment) =>
+                        attachment.dataUrl ? (
+                          <img
+                            key={attachment.id}
+                            src={attachment.dataUrl}
+                            alt={attachment.name}
+                            className="model-test-thumb h-16 w-16 rounded-lg object-cover"
+                          />
+                        ) : (
+                          // Older turns keep their attachment metadata but drop the base64
+                          // payload once the stored history exceeds the browser quota.
+                          <span
+                            key={attachment.id}
+                            className="model-test-muted inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px]"
+                            title={
+                              isZh
+                                ? "图片内容未保存在本地历史中"
+                                : "Image data was not kept in the local history"
+                            }
+                          >
+                            <Paperclip className="h-3 w-3" />
+                            {`${attachment.name} · ${isZh ? "未保留" : "not kept"}`}
+                          </span>
+                        ),
+                      )}
                     </div>
                   ) : null}
 
